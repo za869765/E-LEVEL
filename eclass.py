@@ -27,7 +27,7 @@ from selenium.common.exceptions import (
     WebDriverException, StaleElementReferenceException
 )
 
-VERSION = "1.4.1"
+VERSION = "1.4.4"
 # 打包成 exe 時用 sys.executable 定位，避免存到暫存目錄
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -283,8 +283,10 @@ class EClassApp:
         self.log_area.delete("1.0", tk.END)
 
     def _save_log(self):
-        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"log_{ts}.txt")
+        ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = os.path.join(_BASE_DIR, "log")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, f"log_{ts}.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(self.log_area.get("1.0", tk.END))
         self.log(f"日誌已儲存: {path}")
@@ -335,9 +337,10 @@ class EClassApp:
             self._login_elearn(account, password)
             ok = self._wait_for_login()
             if ok:
-                self.log("登入成功！")
-                self._set_status("已登入 - 可以開始上課")
+                self.log("登入成功！自動開始上課...")
+                self._set_status("已登入 - 自動開始上課")
                 self._set_btn_layout("ready")
+                self._on_start()   # 登入成功 → 自動開始
             else:
                 self.log("⚠ 未偵測到登入成功，請確認瀏覽器狀態")
                 self._set_status("登入未確認 - 可手動按「開始上課」")
@@ -557,39 +560,37 @@ class EClassApp:
             while self.running:
                 self._dismiss_popups()
 
-                # ── 檢查點1：登入狀態驗證 ──
+                # 檢查點：登入狀態
                 if not self._is_logged_in():
                     self.log("⚠ 偵測到登入狀態失效，請重新登入")
                     break
 
-                # ── 檢查點2：確保在儀表板 ──
+                # 回到儀表板 → 切「未完成(有時數)」分頁
                 self.log("進入我的課程...")
                 self.driver.get(DASHBOARD_URL)
                 time.sleep(3)
                 self._dismiss_popups()
+                self._click_unfinished_tab()
 
-                # ── 再次驗證登入（有時跳轉到登入頁）──
-                if not self._is_logged_in():
-                    self.log("⚠ 跳轉後登入失效，停止自動上課")
-                    break
-
-                courses = self._scan_courses()
-                if not courses:
+                # 找下一張課程卡片並點擊（逐一處理，不預先收集所有 URL）
+                entry = self._find_course_entry()
+                if not entry:
                     self.log("沒有找到需要上課的課程！")
                     break
 
-                self.log(f"找到 {len(courses)} 筆待處理課程")
-                for i, course in enumerate(courses):
-                    if not self.running:
-                        break
-                    self.log(f"── 第 {i+1}/{len(courses)} 門 ──")
-                    self._process_course(course)
-                    # ── 檢查點3：每門課結束後確認回主域 ──
-                    self._ensure_on_dashboard()
+                title, needs_log = self._extract_card_info(entry)
+                self.log(f"── 進入課程: {title or '(課程)'}"
+                         + (f" [{needs_log}]" if needs_log else ""))
+                self.driver.execute_script("arguments[0].click()", entry)
+                time.sleep(3)
+
+                # 處理現在所在的課程頁面
+                self._process_current_course_page()
 
                 if self.running:
-                    self.log("上完一組迴圈，程式重新執行上課........")
-                    time.sleep(5)
+                    self.log("本門課程處理完畢，繼續下一門...")
+                    time.sleep(3)
+
         except Exception as e:
             self.log(f"自動上課發生錯誤: {e}")
         finally:
@@ -599,6 +600,124 @@ class EClassApp:
                 self._set_btn_layout("ready")
             else:
                 self._set_btn_layout("pre_login")
+
+    def _click_unfinished_tab(self):
+        """點擊「未完成(有時數)」分頁"""
+        try:
+            tab = None
+            for el in self.driver.find_elements(By.XPATH,
+                    "//*[contains(text(),'未完成') and contains(text(),'時數')]"):
+                if el.is_displayed():
+                    tab = el
+                    break
+            if not tab:
+                for el in self.driver.find_elements(By.XPATH,
+                        "//*[contains(text(),'未完成')]"):
+                    if el.is_displayed():
+                        tab = el
+                        break
+            if tab:
+                self.driver.execute_script("arguments[0].click()", tab)
+                self.log("已切換到「未完成(有時數)」分頁")
+                time.sleep(2)
+        except Exception as e:
+            self.log(f"切換分頁失敗: {e}")
+
+    def _find_course_entry(self):
+        """找「未完成(有時數)」分頁上可點擊的課程入口（支援 onclick/javascript:）"""
+        exclude_text = {"退選", "登出", "搜尋", "排序", "常見問題", "下載",
+                        "回首頁", "簡易操作", "加盟", "學習紀錄", "選課中心",
+                        "學習目標", "了解", "確定", "關閉", "搜尋與排序"}
+
+        # 診斷：列出 onclick 元素
+        try:
+            sample = []
+            for e in self.driver.find_elements(By.XPATH, "//*[@onclick]"):
+                if e.is_displayed():
+                    sample.append(f"{e.tag_name}:{e.text.strip()[:15]}|"
+                                  f"{(e.get_attribute('onclick') or '')[:30]}")
+                if len(sample) >= 15:
+                    break
+            self.log(f"onclick元素：{sample}")
+        except Exception:
+            pass
+
+        # 方法1：有 onclick 的元素
+        try:
+            for el in self.driver.find_elements(By.XPATH, "//*[@onclick]"):
+                if not el.is_displayed():
+                    continue
+                text = el.text.strip()
+                onclick = el.get_attribute("onclick") or ""
+                if any(k in text for k in exclude_text):
+                    continue
+                if any(k in onclick.lower() for k in
+                       ["course", "gopage", "location", "open", "learn", "href"]):
+                    return el
+        except Exception:
+            pass
+
+        # 方法2：javascript: href 且在課程卡片內
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='javascript']"):
+                if not el.is_displayed():
+                    continue
+                if any(k in el.text.strip() for k in exclude_text):
+                    continue
+                try:
+                    el.find_element(By.XPATH,
+                        "./ancestor::div[contains(@class,'course') or "
+                        "contains(@class,'box') or contains(@class,'item') or "
+                        "contains(@class,'card')][1]")
+                    return el
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return None
+
+    def _process_current_course_page(self):
+        """處理目前所在的課程頁面（詳情頁 → 上課去 → 播放器 → 測驗 → 問卷）"""
+        try:
+            self._dismiss_page_popup()
+            self._dismiss_popups()
+            req_min = self._log_course_info()
+
+            try:
+                go_btn = WebDriverWait(self.driver, 8).until(EC.element_to_be_clickable(
+                    (By.XPATH, "//*[normalize-space()='上課去' or "
+                               "normalize-space()='繼續上課' or "
+                               "normalize-space()='開始上課']")))
+                go_btn.click()
+                time.sleep(3)
+                self.log("已點擊「上課去」")
+                if len(self.driver.window_handles) > 1:
+                    self.driver.switch_to.window(self.driver.window_handles[-1])
+                    self.log("切換到課程播放器視窗")
+                self._dismiss_page_popup()
+            except TimeoutException:
+                self.log("找不到「上課去」按鈕，回到儀表板...")
+                self.driver.get(DASHBOARD_URL)
+                return
+
+            self._learning_loop(required_minutes=req_min)
+            self.log("嘗試自動測驗...")
+            self._auto_take_exam()
+            self.log("嘗試自動填問卷...")
+            self._auto_fill_player_survey()
+
+            if len(self.driver.window_handles) > 1:
+                self.driver.close()
+                self.driver.switch_to.window(self.driver.window_handles[0])
+        except Exception as e:
+            self.log(f"處理課程頁面錯誤: {e}")
+            try:
+                if len(self.driver.window_handles) > 1:
+                    self.driver.switch_to.window(self.driver.window_handles[0])
+                self.driver.get(DASHBOARD_URL)
+            except Exception:
+                pass
 
     def _scan_courses(self):
         """掃描「未完成(有時數)」分頁全部課程，支援換頁"""
@@ -625,6 +744,14 @@ class EClassApp:
         except Exception as e:
             self.log(f"切換分頁失敗: {e}")
 
+        # ── 等待課程卡片載入（tab 切換後是 AJAX）──
+        try:
+            WebDriverWait(self.driver, 8).until(lambda d: len(
+                d.find_elements(By.CSS_SELECTOR,
+                    "a[href*='course'], a[href*='open'], a[href*='mooc']")) > 2)
+        except TimeoutException:
+            self.log("等待課程卡片逾時，直接掃描現有內容")
+
         # ── 逐頁收集 ──
         all_courses = []
         page_num = 1
@@ -640,52 +767,44 @@ class EClassApp:
         return all_courses
 
     def _collect_page_courses(self):
-        """收集目前頁面的課程連結（找「繼續/進入課程/開始上課」按鈕）"""
+        """收集目前頁面課程連結（從卡片圖片/標題連結取得，不依賴按鈕文字）"""
         courses = []
         seen = set()
 
-        # ── 方法1：找「繼續」/「進入課程」/「開始上課」/「立即選修」文字連結 ──
-        for xpath in [
-            "//a[normalize-space()='繼續']",
-            "//a[normalize-space()='進入課程']",
-            "//a[normalize-space()='開始上課']",
-            "//a[normalize-space()='立即選修']",
-            "//button[normalize-space()='繼續']",
+        # ── 診斷：列出頁面上所有可見按鈕文字（幫助偵錯）──
+        try:
+            all_btns = self.driver.find_elements(By.XPATH,
+                "//*[self::a or self::button][string-length(normalize-space())>0]")
+            visible_texts = list(dict.fromkeys(
+                b.text.strip() for b in all_btns
+                if b.is_displayed() and b.text.strip()))[:10]
+            self.log(f"頁面可見連結/按鈕：{visible_texts}")
+        except Exception:
+            pass
+
+        skip_kw = {"logout", "login", "javascript:", "dashboard",
+                   "search", "sitemap", "help", "forum", "退選",
+                   "搜尋", "排序", "常見問題", "下載", "加盟", "回首頁",
+                   "學習紀錄", "選課中心", "學習目標", "簡易操作"}
+
+        # ── 方法1：卡片內的圖片連結（課程圖片通常是主要連結）──
+        for sel in [
+            "a[href*='course_main']",
+            "a[href*='course_id']",
+            "a[href*='/open/']",
+            "a[href*='mooc/course']",
+            "a[href*='learn/course']",
         ]:
             try:
-                for el in self.driver.find_elements(By.XPATH, xpath):
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
                     if not el.is_displayed():
                         continue
                     href = el.get_attribute("href") or ""
                     if not href or href in seen:
                         continue
-                    title, needs_log = "", ""
-                    try:
-                        # 向上找最近的卡片容器，取標題與任務徽章
-                        card = el.find_element(By.XPATH,
-                            "./ancestor::div[contains(@class,'course') or "
-                            "contains(@class,'card') or contains(@class,'item')][1]")
-                        for ts in [".//h3", ".//h4",
-                                   ".//p[contains(@class,'title')]",
-                                   ".//span[contains(@class,'title')]"]:
-                            try:
-                                t = card.find_element(By.XPATH, ts).text.strip()
-                                if t:
-                                    title = t
-                                    break
-                            except Exception:
-                                pass
-                        ct = card.text
-                        badges = []
-                        if "閱讀時數" in ct:
-                            badges.append("閱讀")
-                        if "測驗" in ct:
-                            badges.append("測驗")
-                        if "問卷" in ct:
-                            badges.append("問卷")
-                        needs_log = "/".join(badges)
-                    except Exception:
-                        pass
+                    if any(k in href for k in skip_kw):
+                        continue
+                    title, needs_log = self._extract_card_info(el)
                     seen.add(href)
                     courses.append({"href": href, "text": title, "needs_log": needs_log})
             except Exception:
@@ -693,30 +812,65 @@ class EClassApp:
             if courses:
                 break
 
-        # ── 方法2 fallback：找課程 URL 特徵連結 ──
+        # ── 方法2：找所有 a[href] 並過濾出課程路徑 ──
         if not courses:
-            skip = {"logout", "login", "index.php", "javascript",
-                    "dashboard", "search", "sitemap", "help", "forum", "#"}
-            for sel in ["a[href*='course_main']", "a[href*='course_id']",
-                        "a[href*='/course/']", "a[href*='open_course']"]:
-                try:
-                    for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                        if not el.is_displayed():
-                            continue
-                        href = el.get_attribute("href") or ""
-                        if not href or href in seen:
-                            continue
-                        if any(k in href for k in skip):
-                            continue
-                        seen.add(href)
-                        courses.append({"href": href, "text": el.text.strip(),
-                                        "needs_log": "閱讀/測驗/問卷"})
-                except Exception:
-                    pass
-                if courses:
-                    break
+            try:
+                for el in self.driver.find_elements(By.TAG_NAME, "a"):
+                    if not el.is_displayed():
+                        continue
+                    href = el.get_attribute("href") or ""
+                    if not href or href in seen:
+                        continue
+                    if any(k in href for k in skip_kw):
+                        continue
+                    # 只保留看起來像課程頁的 URL
+                    if not any(k in href for k in
+                               ["course", "open", "mooc", "learn", "class"]):
+                        continue
+                    if "elearn.hrd.gov.tw" not in href:
+                        continue
+                    # 排除目前頁面（儀表板）
+                    if "learn_dashboard" in href or "co_login" in href:
+                        continue
+                    title, needs_log = self._extract_card_info(el)
+                    seen.add(href)
+                    courses.append({"href": href, "text": title, "needs_log": needs_log})
+            except Exception:
+                pass
 
         return courses
+
+    def _extract_card_info(self, el):
+        """從連結元素向上找卡片容器，回傳 (title, needs_log)"""
+        title, needs_log = "", ""
+        try:
+            card = el.find_element(By.XPATH,
+                "./ancestor::div[contains(@class,'course') or "
+                "contains(@class,'card') or contains(@class,'item') or "
+                "contains(@class,'box')][1]")
+            for ts in [".//h3", ".//h4", ".//p[contains(@class,'title')]",
+                       ".//span[contains(@class,'title')]",
+                       ".//div[contains(@class,'title')]",
+                       ".//strong", ".//b"]:
+                try:
+                    t = card.find_element(By.XPATH, ts).text.strip()
+                    if t and len(t) > 3:
+                        title = t
+                        break
+                except Exception:
+                    pass
+            ct = card.text
+            badges = []
+            if "閱讀時數" in ct:
+                badges.append("閱讀")
+            if "測驗" in ct:
+                badges.append("測驗")
+            if "問卷" in ct:
+                badges.append("問卷")
+            needs_log = "/".join(badges)
+        except Exception:
+            pass
+        return title, needs_log
 
     def _click_next_page(self):
         """點下一頁按鈕，回傳 True=成功翻頁 / False=已是最後頁"""
