@@ -27,7 +27,7 @@ from selenium.common.exceptions import (
     WebDriverException, StaleElementReferenceException
 )
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 # 打包成 exe 時用 sys.executable 定位，避免存到暫存目錄
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -48,6 +48,7 @@ class EClassApp:
         self.driver   = None
         self.running  = False
         self.cycle_count = 0
+        self._tried_hrefs = set()   # 本次執行已嘗試過的課程 href，避免無限迴圈
         self.config   = self._load_config()
 
         self.root = tk.Tk()
@@ -556,6 +557,8 @@ class EClassApp:
             self._set_btn_layout("pre_login")
 
     def _auto_learn_main(self):
+        # 重置「已嘗試課程」清單（每次按開始上課都從頭算）
+        self._tried_hrefs = set()
         try:
             while self.running:
                 self._dismiss_popups()
@@ -563,7 +566,7 @@ class EClassApp:
                     self.log("⚠ 偵測到登入狀態失效，請重新登入")
                     break
 
-                # ── 第一階段：未完成(有時數)課程 ──
+                # ── 第一階段：未完成(有時數)課程 → 讀+測驗+問卷 ──
                 self.log("進入我的課程...")
                 self.driver.get(DASHBOARD_URL)
                 time.sleep(3)
@@ -572,26 +575,39 @@ class EClassApp:
 
                 entry = self._find_course_entry()
                 if entry:
-                    title, needs_log = self._extract_card_info(entry)
-                    self.log(f"── 進入課程: {title or '(課程)'}"
-                             + (f" [{needs_log}]" if needs_log else ""))
-                    self.driver.execute_script("arguments[0].click()", entry)
-                    time.sleep(3)
-                    self._process_current_course_page()
-                    if self.running:
-                        self.log("本門課程處理完畢，繼續下一門...")
+                    href = entry.get_attribute("href") or ""
+                    if href and href in self._tried_hrefs:
+                        self.log(f"⚠ 此課程已嘗試過（{href[:60]}），跳過第一階段")
+                    else:
+                        if href:
+                            self._tried_hrefs.add(href)
+                        title, needs_log = self._extract_card_info(entry)
+                        self.log(f"── 進入課程: {title or '(課程)'}"
+                                 + (f" [{needs_log}]" if needs_log else ""))
+                        self.driver.execute_script("arguments[0].click()", entry)
                         time.sleep(3)
-                    continue
+                        self._process_current_course_page()
+                        if self.running:
+                            self.log("本門課程處理完畢，繼續下一門...")
+                            time.sleep(3)
+                        continue
 
-                # ── 第二階段：已完成課程補做測驗/問卷 ──
-                self.log("未完成課程已清空，掃描待補測驗...")
+                # ── 第二階段：已完成課程 → 補測驗 / 補問卷 ──
+                self.log("未完成課程已清空，掃描待補測驗/問卷...")
                 self._click_tab("已完成")
                 time.sleep(2)
-                exam_entry = self._find_exam_pending_entry()
-                if exam_entry:
-                    title, _ = self._extract_card_info(exam_entry)
-                    self.log(f"── 補做測驗: {title or '(課程)'}")
-                    self.driver.execute_script("arguments[0].click()", exam_entry)
+                pend_entry, reason = self._find_pending_work_entry()
+                if pend_entry:
+                    href = pend_entry.get_attribute("href") or ""
+                    if href and href in self._tried_hrefs:
+                        self.log(f"⚠ 此課程已嘗試過（{href[:60]}），結束")
+                        break
+                    if href:
+                        self._tried_hrefs.add(href)
+                    title, _ = self._extract_card_info(pend_entry)
+                    label = {"exam": "補做測驗", "survey": "補做問卷"}.get(reason, "補做")
+                    self.log(f"── {label}: {title or '(課程)'}")
+                    self.driver.execute_script("arguments[0].click()", pend_entry)
                     time.sleep(3)
                     self._process_current_course_page()
                     if self.running:
@@ -692,8 +708,14 @@ class EClassApp:
 
         return None
 
-    def _find_exam_pending_entry(self):
-        """在已完成課程中找到測驗分數為 0 或尚未完成測驗的課程入口"""
+    def _find_pending_work_entry(self):
+        """在已完成課程中找到還有待完成工作的課程入口
+        回傳 (element, reason)：reason ∈ {'exam', 'survey', None}
+        判斷規則：
+          - 測驗分數：0 分 → exam
+          - 問卷狀態：未填寫 → survey
+        已嘗試過的課程（self._tried_hrefs）會跳過
+        """
         course_selectors = [
             "a[href*='course_main']",
             "a[href*='course_id']",
@@ -712,7 +734,9 @@ class EClassApp:
                     href = el.get_attribute("href") or ""
                     if any(k in href for k in skip_hrefs):
                         continue
-                    # 找父卡片，檢查是否有待完成測驗
+                    if href and href in self._tried_hrefs:
+                        continue
+                    # 找父卡片，檢查待完成項目
                     try:
                         card = el.find_element(By.XPATH,
                             "./ancestor::div[contains(@class,'course') or "
@@ -721,14 +745,15 @@ class EClassApp:
                         card_text = card.text
                         # 測驗分數：0 分 → 需補考
                         if re.search(r'測驗分數[：:]\s*0\s*分', card_text):
-                            return el
-                        # 有「測驗」標籤但沒有勾選 → 也算待完成
-                        # （備用邏輯，部分課程不顯示分數）
+                            return el, "exam"
+                        # 問卷狀態：未填寫 → 需補問卷
+                        if re.search(r'問卷狀態[：:]\s*未填寫', card_text):
+                            return el, "survey"
                     except Exception:
                         pass
             except Exception:
                 pass
-        return None
+        return None, None
 
     def _process_current_course_page(self):
         """處理目前所在的課程頁面（詳情頁 → 上課去 → 播放器 → 測驗 → 問卷）"""
