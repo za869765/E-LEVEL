@@ -1,0 +1,20 @@
+# PyInstaller
+build/
+*.spec
+
+# 舊版 EXE
+dist/old/
+
+# 設定檔（含帳密）
+dist/data/
+eclass_config.json
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 測試 / 日誌
+test.py
+log_*.txt
