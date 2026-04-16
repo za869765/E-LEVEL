@@ -12,8 +12,10 @@ E等公務園 自動上課輔助工具 v1.8.2
    * Cycling：失敗後絕不重蹈覆轍（option-label hash 跨 attempt 穩定）
    * 失敗後 _harvest_from_result_page 持續學習（從結果頁挖正解）
    * 失敗 dump 整份 page_source + 截圖（找隱藏正解）
-   * Uncap retries（pass / 系統限制 / 連續零學習才停）
-   * 本次執行統計
+   * 重考改 30 次（pass / 系統限制 / 連續 8 次零學習才停）
+     —「學習」= harvester 收成 + cycling 新排除錯選項
+   * 本次執行統計（含 options_eliminated）
+   * 問卷快速跳出：偵測「修改問卷／查看問卷」立刻 return，不空等
 """
 
 import tkinter as tk
@@ -2237,6 +2239,69 @@ class EClassApp:
             except Exception:
                 pass
 
+    def _survey_already_done(self):
+        """v1.8.2：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
+        看到任一 → 立刻 return True，主流程直接跳下一門課，不空等。
+        """
+        DONE_KEYS = ("修改問卷", "查看問卷", "查看結果", "已填寫", "已繳交",
+                     "已完成", "重新填寫")
+        # XPath 一次抓所有「按鈕級別」的元素
+        XP = (
+            "//a[" + " or ".join([f"contains(normalize-space(.),'{k}')" for k in DONE_KEYS]) + "] | "
+            "//button[" + " or ".join([f"contains(normalize-space(.),'{k}')" for k in DONE_KEYS]) + "] | "
+            "//*[contains(@class,'btn') and (" +
+            " or ".join([f"contains(normalize-space(.),'{k}')" for k in DONE_KEYS]) + ")] | "
+            "//*[contains(@class,'process-btn') and (" +
+            " or ".join([f"contains(normalize-space(.),'{k}')" for k in DONE_KEYS]) + ")]"
+        )
+
+        def _hit():
+            try:
+                els = self.driver.find_elements(By.XPATH, XP)
+                for el in els:
+                    try:
+                        if not el.is_displayed():
+                            continue
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return False
+
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        if _hit():
+            return True
+        try:
+            for fr in self._all_frames():
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(fr)
+                    if _hit():
+                        return True
+                    for inner in self._all_frames():
+                        try:
+                            self.driver.switch_to.frame(inner)
+                            if _hit():
+                                return True
+                            self.driver.switch_to.parent_frame()
+                        except Exception:
+                            try:
+                                self.driver.switch_to.parent_frame()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+        return False
+
     def _can_fill_survey_now(self):
         """檢查是否在任一 frame 中存在「未填寫」狀態的問卷按鈕。
         v1.8.1：排除「修改問卷／已填寫／已繳交／done/pass/finish/disabled」狀態。
@@ -2329,12 +2394,17 @@ class EClassApp:
     def _try_jump_to_survey_sysbar(self):
         """跳到「問卷/評價」頁，回傳是否實際出現可填問卷
         v1.6.2：輪詢 12 秒等 frame 載入
+        v1.8.2：偵測到「修改問卷／查看問卷／已填寫」立刻 return False（已填過、不空等）
         """
         if not self._try_jump_to_sysbar_link(
                 ["問卷/評價", "問卷", "questionnaire"], "問卷/評價"):
             return False
         for i in range(12):
             self._human_sleep(1.0, 0.2)
+            # v1.8.2：問卷已填 → 立刻離開
+            if self._survey_already_done():
+                self.log(f"⏭ 問卷已填寫（第{i+1}秒偵測到「修改問卷／查看問卷」），跳過不空等")
+                return False
             if self._can_fill_survey_now():
                 self.log(f"✓ 偵測到可填問卷（第{i+1}秒）")
                 return True
@@ -2879,13 +2949,15 @@ class EClassApp:
         except Exception as e:
             self.log(f"⚠ dump 失敗：{e}")
 
-    def _auto_take_exam(self, max_retries=20):
+    def _auto_take_exam(self, max_retries=30):
         """v1.8.2：跨 frame + 新視窗 + 失敗自動重考
-        停止條件：
+        停止條件（任一觸發）：
           1. 通過 (pass)
           2. 系統作答次數已達上限 (_exam_attempts_exhausted)
-          3. 連續 N 次零學習（題庫沒成長 + 沒有未試過的選項組合）
-          4. 達到 max_retries 上限（hard ceiling，預設 20）
+          3. 連續 8 次零學習（既無 harvester 收成，也無新 cycling 排除）
+          4. 達到 max_retries 上限（hard ceiling，預設 30）
+        「學習」=（harvester 新增題數）+（cycling 新試過的選項數）
+        只要任一非零，零學習計數就歸零，繼續累積經驗。
         """
         try:
             try:
@@ -2903,13 +2975,17 @@ class EClassApp:
             # 重置本門課的 cycling 狀態（新一門課，選項組合不一樣）
             self._exam_session_tried = {}
             self._exam_no_learn_streak = 0
-            ZERO_LEARN_LIMIT = 3
+            ZERO_LEARN_LIMIT = 8   # 連續 8 次毫無進步才放棄
             prev_qa_count = self.qa_bank.count()
 
             passed = False
             for attempt in range(1, max_retries + 1):
                 self.log(f"━━ 測驗第 {attempt}/{max_retries} 次嘗試 ━━")
                 self._stats["exam_attempts"] += 1
+
+                # 紀錄答題前 cycling 已試過的選項總數（學習量量測基準）
+                tried_before = sum(len(v) for v in self._exam_session_tried.values())
+
                 ok = self._do_one_exam_attempt()
                 if not ok:
                     self.log("此次未送出成功，跳出重考迴圈")
@@ -2935,18 +3011,29 @@ class EClassApp:
 
                 if result == "fail":
                     self.log(f"❌ 第 {attempt} 次：未通過")
-                    # 學習階段：harvest + dump
+                    # 學習量 1：harvester 新增題庫
+                    n_h = 0
                     try:
                         n_h, _ = self._harvest_from_result_page()
                         if n_h > 0:
                             self.log(f"📥 失敗頁 harvester 拔到 {n_h} 題正解")
                             self._stats["harvested_questions"] += n_h
-                            self._exam_no_learn_streak = 0
-                        else:
-                            self._exam_no_learn_streak += 1
                     except Exception as _eh:
                         self.log(f"⚠ harvester 例外: {_eh}")
+
+                    # 學習量 2：cycling 新排除的錯選項
+                    tried_after = sum(len(v) for v in self._exam_session_tried.values())
+                    delta_tried = tried_after - tried_before
+                    if delta_tried > 0:
+                        self._stats["options_eliminated"] += delta_tried
+
+                    # 任一學習量 > 0 → 計數歸零；否則 +1
+                    if (n_h > 0) or (delta_tried > 0):
+                        self._exam_no_learn_streak = 0
+                        self.log(f"📈 第 {attempt} 次學習：題庫 +{n_h}、排除 {delta_tried} 個錯選項")
+                    else:
                         self._exam_no_learn_streak += 1
+                        self.log(f"⚠ 第 {attempt} 次零學習（連續 {self._exam_no_learn_streak}/{ZERO_LEARN_LIMIT}）")
 
                     # 第 1 次失敗一定 dump（看是否有寶藏可挖）
                     if attempt == 1:
@@ -2964,7 +3051,7 @@ class EClassApp:
 
                     # 連續零學習 → 放棄
                     if self._exam_no_learn_streak >= ZERO_LEARN_LIMIT:
-                        self.log(f"🛑 連續 {ZERO_LEARN_LIMIT} 次零學習（題庫沒成長），停止重考")
+                        self.log(f"🛑 連續 {ZERO_LEARN_LIMIT} 次零學習，停止重考（已嘗試 {attempt} 次）")
                         self._stats["courses_failed"] += 1
                         break
 
@@ -2986,8 +3073,9 @@ class EClassApp:
 
             # 統計這門課的成長
             grown = self.qa_bank.count() - prev_qa_count
-            if grown > 0:
-                self.log(f"📈 本門課題庫成長 +{grown} 題（總計 {self.qa_bank.count()}）")
+            total_tried = sum(len(v) for v in self._exam_session_tried.values())
+            if grown > 0 or total_tried > 0:
+                self.log(f"📈 本門課總成長：題庫 +{grown}、cycling 排除 {total_tried} 個錯選項（題庫總計 {self.qa_bank.count()}）")
             if not passed:
                 self.log(f"💔 本門課未過關（嘗試 {attempt} 次）")
 
@@ -3619,19 +3707,31 @@ class EClassApp:
     # ── 課程播放器：自動填問卷 ───────────────────────────────
 
     def _auto_fill_player_survey(self):
-        """在播放器內自動填問卷/評價（v1.6.2：跨 frame + 新視窗）"""
+        """在播放器內自動填問卷/評價（v1.6.2：跨 frame + 新視窗）
+        v1.8.2：開頭快速偵測「修改問卷」狀態 → 立刻離開（不空等、不重複送）
+        """
         try:
             try:
                 self.driver.switch_to.default_content()
             except Exception:
                 pass
 
+            # v1.8.2：第一道關卡 — 已填過就直接走
+            if self._survey_already_done():
+                self.log("⏭ 問卷已填寫（修改問卷／查看問卷），直接進下一門")
+                return
+
             # 若目前頁面已有可填問卷按鈕（已被 _try_jump_to_survey_sysbar 帶到），就不重點連結
             if not self._can_fill_survey_now():
                 self.log("目前頁面看不到問卷按鈕，先嘗試跳到問卷頁...")
                 if not self._try_jump_to_survey_sysbar():
-                    self.log("跳問卷頁失敗，放棄自動填問卷")
+                    self.log("跳問卷頁失敗或問卷已填，放棄自動填問卷")
                     return
+
+            # v1.8.2：第二道關卡 — 跳到問卷頁後再確認一次
+            if self._survey_already_done():
+                self.log("⏭ 問卷頁顯示已填寫，跳過")
+                return
 
             # 跨 frame 找「填寫問卷」/「進行問卷」/「開始填寫」按鈕
             # v1.8.1：拿掉「修改問卷」（已填過），點下去會重複送問卷
