@@ -27,7 +27,7 @@ from selenium.common.exceptions import (
     WebDriverException, StaleElementReferenceException
 )
 
-VERSION = "1.4.4"
+VERSION = "1.5.0"
 # 打包成 exe 時用 sys.executable 定位，避免存到暫存目錄
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -559,37 +559,47 @@ class EClassApp:
         try:
             while self.running:
                 self._dismiss_popups()
-
-                # 檢查點：登入狀態
                 if not self._is_logged_in():
                     self.log("⚠ 偵測到登入狀態失效，請重新登入")
                     break
 
-                # 回到儀表板 → 切「未完成(有時數)」分頁
+                # ── 第一階段：未完成(有時數)課程 ──
                 self.log("進入我的課程...")
                 self.driver.get(DASHBOARD_URL)
                 time.sleep(3)
                 self._dismiss_popups()
-                self._click_unfinished_tab()
+                self._click_tab("未完成")
 
-                # 找下一張課程卡片並點擊（逐一處理，不預先收集所有 URL）
                 entry = self._find_course_entry()
-                if not entry:
-                    self.log("沒有找到需要上課的課程！")
-                    break
-
-                title, needs_log = self._extract_card_info(entry)
-                self.log(f"── 進入課程: {title or '(課程)'}"
-                         + (f" [{needs_log}]" if needs_log else ""))
-                self.driver.execute_script("arguments[0].click()", entry)
-                time.sleep(3)
-
-                # 處理現在所在的課程頁面
-                self._process_current_course_page()
-
-                if self.running:
-                    self.log("本門課程處理完畢，繼續下一門...")
+                if entry:
+                    title, needs_log = self._extract_card_info(entry)
+                    self.log(f"── 進入課程: {title or '(課程)'}"
+                             + (f" [{needs_log}]" if needs_log else ""))
+                    self.driver.execute_script("arguments[0].click()", entry)
                     time.sleep(3)
+                    self._process_current_course_page()
+                    if self.running:
+                        self.log("本門課程處理完畢，繼續下一門...")
+                        time.sleep(3)
+                    continue
+
+                # ── 第二階段：已完成課程補做測驗/問卷 ──
+                self.log("未完成課程已清空，掃描待補測驗...")
+                self._click_tab("已完成")
+                time.sleep(2)
+                exam_entry = self._find_exam_pending_entry()
+                if exam_entry:
+                    title, _ = self._extract_card_info(exam_entry)
+                    self.log(f"── 補做測驗: {title or '(課程)'}")
+                    self.driver.execute_script("arguments[0].click()", exam_entry)
+                    time.sleep(3)
+                    self._process_current_course_page()
+                    if self.running:
+                        time.sleep(3)
+                    continue
+
+                self.log("所有課程已完成！")
+                break
 
         except Exception as e:
             self.log(f"自動上課發生錯誤: {e}")
@@ -601,46 +611,47 @@ class EClassApp:
             else:
                 self._set_btn_layout("pre_login")
 
-    def _click_unfinished_tab(self):
-        """點擊「未完成(有時數)」分頁"""
+    def _click_tab(self, keyword):
+        """點擊包含 keyword 的分頁，回傳是否成功"""
         try:
-            tab = None
             for el in self.driver.find_elements(By.XPATH,
-                    "//*[contains(text(),'未完成') and contains(text(),'時數')]"):
+                    f"//*[contains(text(),'{keyword}')]"):
                 if el.is_displayed():
-                    tab = el
-                    break
-            if not tab:
-                for el in self.driver.find_elements(By.XPATH,
-                        "//*[contains(text(),'未完成')]"):
-                    if el.is_displayed():
-                        tab = el
-                        break
-            if tab:
-                self.driver.execute_script("arguments[0].click()", tab)
-                self.log("已切換到「未完成(有時數)」分頁")
-                time.sleep(2)
+                    self.driver.execute_script("arguments[0].click()", el)
+                    self.log(f"已切換到「{keyword}」分頁")
+                    time.sleep(2)
+                    return True
         except Exception as e:
             self.log(f"切換分頁失敗: {e}")
+        return False
 
     def _find_course_entry(self):
-        """找「未完成(有時數)」分頁上可點擊的課程入口（支援 onclick/javascript:）"""
+        """找「未完成(有時數)」分頁上可點擊的課程入口（優先標準 href，再 onclick/javascript:）"""
         exclude_text = {"退選", "登出", "搜尋", "排序", "常見問題", "下載",
                         "回首頁", "簡易操作", "加盟", "學習紀錄", "選課中心",
                         "學習目標", "了解", "確定", "關閉", "搜尋與排序"}
 
-        # 診斷：列出 onclick 元素
-        try:
-            sample = []
-            for e in self.driver.find_elements(By.XPATH, "//*[@onclick]"):
-                if e.is_displayed():
-                    sample.append(f"{e.tag_name}:{e.text.strip()[:15]}|"
-                                  f"{(e.get_attribute('onclick') or '')[:30]}")
-                if len(sample) >= 15:
-                    break
-            self.log(f"onclick元素：{sample}")
-        except Exception:
-            pass
+        # 方法0（最高優先）：標準課程 href 連結
+        course_selectors = [
+            "a[href*='course_main']",
+            "a[href*='course_id']",
+            "a[href*='/open/']",
+            "a[href*='mooc/course']",
+            "a[href*='learn/course']",
+            "a[href*='courseId']",
+        ]
+        skip_hrefs = {"dashboard", "logout", "login", "search", "sitemap"}
+        for sel in course_selectors:
+            try:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if not el.is_displayed():
+                        continue
+                    href = el.get_attribute("href") or ""
+                    if any(k in href for k in skip_hrefs):
+                        continue
+                    return el
+            except Exception:
+                pass
 
         # 方法1：有 onclick 的元素
         try:
@@ -657,12 +668,16 @@ class EClassApp:
         except Exception:
             pass
 
-        # 方法2：javascript: href 且在課程卡片內
+        # 方法2：javascript: href 且在課程卡片內（過濾分享連結）
+        share_kw = {"share", "wechat", "fb", "line"}
         try:
             for el in self.driver.find_elements(By.CSS_SELECTOR, "a[href^='javascript']"):
                 if not el.is_displayed():
                     continue
                 if any(k in el.text.strip() for k in exclude_text):
+                    continue
+                href = el.get_attribute("href") or ""
+                if any(k in href.lower() for k in share_kw):
                     continue
                 try:
                     el.find_element(By.XPATH,
@@ -675,6 +690,44 @@ class EClassApp:
         except Exception:
             pass
 
+        return None
+
+    def _find_exam_pending_entry(self):
+        """在已完成課程中找到測驗分數為 0 或尚未完成測驗的課程入口"""
+        course_selectors = [
+            "a[href*='course_main']",
+            "a[href*='course_id']",
+            "a[href*='/open/']",
+            "a[href*='mooc/course']",
+            "a[href*='learn/course']",
+            "a[href*='courseId']",
+        ]
+        skip_hrefs = {"dashboard", "logout", "login", "search", "sitemap"}
+
+        for sel in course_selectors:
+            try:
+                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
+                    if not el.is_displayed():
+                        continue
+                    href = el.get_attribute("href") or ""
+                    if any(k in href for k in skip_hrefs):
+                        continue
+                    # 找父卡片，檢查是否有待完成測驗
+                    try:
+                        card = el.find_element(By.XPATH,
+                            "./ancestor::div[contains(@class,'course') or "
+                            "contains(@class,'card') or contains(@class,'item') or "
+                            "contains(@class,'box')][1]")
+                        card_text = card.text
+                        # 測驗分數：0 分 → 需補考
+                        if re.search(r'測驗分數[：:]\s*0\s*分', card_text):
+                            return el
+                        # 有「測驗」標籤但沒有勾選 → 也算待完成
+                        # （備用邏輯，部分課程不顯示分數）
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         return None
 
     def _process_current_course_page(self):
@@ -697,7 +750,12 @@ class EClassApp:
                     self.log("切換到課程播放器視窗")
                 self._dismiss_page_popup()
             except TimeoutException:
-                self.log("找不到「上課去」按鈕，回到儀表板...")
+                self.log("找不到「上課去」按鈕，嘗試直接進行測驗/問卷...")
+                # 試著直接做測驗（課程可能只剩測驗）
+                self._auto_take_exam()
+                self._auto_fill_player_survey()
+                if not self.running:
+                    return
                 self.driver.get(DASHBOARD_URL)
                 return
 
@@ -718,127 +776,6 @@ class EClassApp:
                 self.driver.get(DASHBOARD_URL)
             except Exception:
                 pass
-
-    def _scan_courses(self):
-        """掃描「未完成(有時數)」分頁全部課程，支援換頁"""
-        time.sleep(2)
-
-        # ── 點「未完成(有時數)」分頁（精確匹配，避免誤點「已完成」）──
-        try:
-            tab = None
-            for el in self.driver.find_elements(By.XPATH,
-                    "//*[contains(text(),'未完成') and contains(text(),'時數')]"):
-                if el.is_displayed():
-                    tab = el
-                    break
-            if not tab:
-                for el in self.driver.find_elements(By.XPATH,
-                        "//*[contains(text(),'未完成')]"):
-                    if el.is_displayed():
-                        tab = el
-                        break
-            if tab:
-                self.driver.execute_script("arguments[0].click()", tab)
-                self.log("已切換到「未完成(有時數)」分頁")
-                time.sleep(2)
-        except Exception as e:
-            self.log(f"切換分頁失敗: {e}")
-
-        # ── 等待課程卡片載入（tab 切換後是 AJAX）──
-        try:
-            WebDriverWait(self.driver, 8).until(lambda d: len(
-                d.find_elements(By.CSS_SELECTOR,
-                    "a[href*='course'], a[href*='open'], a[href*='mooc']")) > 2)
-        except TimeoutException:
-            self.log("等待課程卡片逾時，直接掃描現有內容")
-
-        # ── 逐頁收集 ──
-        all_courses = []
-        page_num = 1
-        while True:
-            page_courses = self._collect_page_courses()
-            self.log(f"第 {page_num} 頁找到 {len(page_courses)} 筆課程")
-            all_courses.extend(page_courses)
-            if not self._click_next_page():
-                break
-            page_num += 1
-            time.sleep(2)
-
-        return all_courses
-
-    def _collect_page_courses(self):
-        """收集目前頁面課程連結（從卡片圖片/標題連結取得，不依賴按鈕文字）"""
-        courses = []
-        seen = set()
-
-        # ── 診斷：列出頁面上所有可見按鈕文字（幫助偵錯）──
-        try:
-            all_btns = self.driver.find_elements(By.XPATH,
-                "//*[self::a or self::button][string-length(normalize-space())>0]")
-            visible_texts = list(dict.fromkeys(
-                b.text.strip() for b in all_btns
-                if b.is_displayed() and b.text.strip()))[:10]
-            self.log(f"頁面可見連結/按鈕：{visible_texts}")
-        except Exception:
-            pass
-
-        skip_kw = {"logout", "login", "javascript:", "dashboard",
-                   "search", "sitemap", "help", "forum", "退選",
-                   "搜尋", "排序", "常見問題", "下載", "加盟", "回首頁",
-                   "學習紀錄", "選課中心", "學習目標", "簡易操作"}
-
-        # ── 方法1：卡片內的圖片連結（課程圖片通常是主要連結）──
-        for sel in [
-            "a[href*='course_main']",
-            "a[href*='course_id']",
-            "a[href*='/open/']",
-            "a[href*='mooc/course']",
-            "a[href*='learn/course']",
-        ]:
-            try:
-                for el in self.driver.find_elements(By.CSS_SELECTOR, sel):
-                    if not el.is_displayed():
-                        continue
-                    href = el.get_attribute("href") or ""
-                    if not href or href in seen:
-                        continue
-                    if any(k in href for k in skip_kw):
-                        continue
-                    title, needs_log = self._extract_card_info(el)
-                    seen.add(href)
-                    courses.append({"href": href, "text": title, "needs_log": needs_log})
-            except Exception:
-                pass
-            if courses:
-                break
-
-        # ── 方法2：找所有 a[href] 並過濾出課程路徑 ──
-        if not courses:
-            try:
-                for el in self.driver.find_elements(By.TAG_NAME, "a"):
-                    if not el.is_displayed():
-                        continue
-                    href = el.get_attribute("href") or ""
-                    if not href or href in seen:
-                        continue
-                    if any(k in href for k in skip_kw):
-                        continue
-                    # 只保留看起來像課程頁的 URL
-                    if not any(k in href for k in
-                               ["course", "open", "mooc", "learn", "class"]):
-                        continue
-                    if "elearn.hrd.gov.tw" not in href:
-                        continue
-                    # 排除目前頁面（儀表板）
-                    if "learn_dashboard" in href or "co_login" in href:
-                        continue
-                    title, needs_log = self._extract_card_info(el)
-                    seen.add(href)
-                    courses.append({"href": href, "text": title, "needs_log": needs_log})
-            except Exception:
-                pass
-
-        return courses
 
     def _extract_card_info(self, el):
         """從連結元素向上找卡片容器，回傳 (title, needs_log)"""
@@ -898,59 +835,6 @@ class EClassApp:
             pass
         return False
 
-    def _process_course(self, course):
-        try:
-            needs_log = course.get("needs_log", "")
-            title = course.get("text", "") or course["href"][:60]
-            self.log(f"進入課程: {title}" + (f" [{needs_log}]" if needs_log else ""))
-            self.driver.get(course["href"])
-            time.sleep(3)
-            self._dismiss_page_popup()
-            self._dismiss_popups()
-            req_min = self._log_course_info()  # 取得 50% 時數門檻（分鐘）
-
-            # 點「上課去」進入課程播放器
-            entered = False
-            try:
-                go_btn = WebDriverWait(self.driver, 8).until(EC.element_to_be_clickable(
-                    (By.XPATH, "//*[normalize-space()='上課去' or normalize-space()='繼續上課'"
-                               " or normalize-space()='開始上課']")))
-                go_btn.click()
-                time.sleep(3)
-                self.log("已點擊「上課去」")
-                if len(self.driver.window_handles) > 1:
-                    self.driver.switch_to.window(self.driver.window_handles[-1])
-                    self.log("切換到課程播放器視窗")
-                self._dismiss_page_popup()
-                entered = True
-            except TimeoutException:
-                self.log("找不到「上課去」按鈕，回到儀表板...")
-                self.driver.get(DASHBOARD_URL)
-                return
-
-            if entered:
-                self._learning_loop(required_minutes=req_min)
-                self.log("嘗試自動測驗...")
-                self._auto_take_exam()
-                self.log("嘗試自動填問卷...")
-                self._auto_fill_player_survey()
-                self.log("本門課程處理完畢，繼續下一門...")
-
-            # 播放器是新視窗則關閉，切回主視窗
-            if len(self.driver.window_handles) > 1:
-                self.driver.close()
-                self.driver.switch_to.window(self.driver.window_handles[0])
-
-        except Exception as e:
-            self.log(f"處理課程錯誤: {e}")
-            # 檢查點：發生錯誤後切回主視窗並回到儀表板
-            try:
-                if len(self.driver.window_handles) > 1:
-                    self.driver.switch_to.window(self.driver.window_handles[0])
-                self.driver.get(DASHBOARD_URL)
-            except Exception:
-                pass
-
     def _log_course_info(self):
         """印出課程時數資訊，回傳需要上課的分鐘數（50% 門檻），0 代表未知"""
         try:
@@ -992,22 +876,6 @@ class EClassApp:
         except Exception:
             pass
         return False
-
-    def _try_fill_survey(self):
-        try:
-            for sel in ["a[href*='survey']", "a[href*='evaluate']", "a[href*='questionnaire']"]:
-                try:
-                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
-                    if btn.is_displayed():
-                        btn.click()
-                        time.sleep(3)
-                        self._auto_fill_survey_form()
-                        self.log("該課完成問卷")
-                        return
-                except NoSuchElementException:
-                    pass
-        except Exception as e:
-            self.log(f"填問卷失敗: {e}")
 
     def _auto_fill_survey_form(self):
         try:
