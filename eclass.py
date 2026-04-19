@@ -1,12 +1,12 @@
 """
-E等公務園 自動上課輔助工具 v1.8.2
+E等公務園 自動上課輔助工具 v1.8.3
 - 自動管理瀏覽器驅動版本（永遠不會版本不符）
 - 支援 E等公務人員（我的e政府）/ 人事服務網eCPA 登入
 - 多組帳號記憶與快速切換
 - 自動掃描未完成課程 → 循環上課 → 自動關彈窗
 - v1.8.0：登入後自動 prefetch 待考課程題庫（roddayeye 痞客幫）
 - v1.8.1：修「已填問卷誤點修改問卷」/「[ ] CSS selector 失敗」
-- v1.8.2：盲考生強化套件
+- v1.8.3：盲考生強化套件
    * 題目文字 reverse DOM walk（解決抓不到題目）
    * 押題：以上皆是優先 / 一定絕對排除 / TF 對否語意 / 多選預設全選
    * Cycling：失敗後絕不重蹈覆轍（option-label hash 跨 attempt 穩定）
@@ -52,7 +52,7 @@ except Exception as _e:
     _SCRAPER_AVAILABLE = False
     _SCRAPER_IMPORT_ERR = str(_e)
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 # 打包成 exe 時用 sys.executable 定位，避免存到暫存目錄
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -207,13 +207,13 @@ class EClassApp:
         self._current_course_title = ""   # 答題自動學習用
         # 累計本次執行所有「題庫沒命中」題目，stop 時 dump 到 qa_missed.json
         self._missed_questions = {}
-        # v1.8.2：選項 cycling — 記錄每題試過的選項，避免下一次重蹈覆轍
+        # v1.8.3：選項 cycling — 記錄每題試過的選項，避免下一次重蹈覆轍
         # key = options_signature  (依題目選項組合 hash，跨 attempt 穩定)
         # value = set of normalized option labels already tried
         self._exam_session_tried = {}
-        # v1.8.2：本次測驗的零學習計數（連續多次 attempt 無題庫成長 → 放棄）
+        # v1.8.3：本次測驗的零學習計數（連續多次 attempt 無題庫成長 → 放棄）
         self._exam_no_learn_streak = 0
-        # v1.8.2：執行期統計
+        # v1.8.3：執行期統計
         self._stats = {
             "courses_attempted": 0, "courses_passed": 0, "courses_failed": 0,
             "exam_attempts": 0, "exams_passed": 0,
@@ -1142,7 +1142,7 @@ class EClassApp:
                 if not self.qa_bank.find(qtext):
                     self.qa_bank.add(qtext, ans, qtype=qtype, course=name)
                     n_added += 1
-            # v1.8.2：「題庫已備齊」也算 done，否則一直被當 miss
+            # v1.8.3：「題庫已備齊」也算 done，否則一直被當 miss
             has_answers = n_total > 0
             with self._prefetch_lock:
                 self._prefetch_status[k] = "done" if has_answers else "miss"
@@ -1190,7 +1190,7 @@ class EClassApp:
     def _on_stop(self):
         self.running = False
         self._set_status("已停止")
-        # v1.8.2：印統計
+        # v1.8.3：印統計
         try:
             self._print_session_stats()
         except Exception:
@@ -2305,7 +2305,7 @@ class EClassApp:
                 pass
 
     def _survey_already_done(self):
-        """v1.8.2：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
+        """v1.8.3：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
         看到任一 → 立刻 return True，主流程直接跳下一門課，不空等。
         """
         DONE_KEYS = ("修改問卷", "查看問卷", "查看結果", "已填寫", "已繳交",
@@ -2459,14 +2459,14 @@ class EClassApp:
     def _try_jump_to_survey_sysbar(self):
         """跳到「問卷/評價」頁，回傳是否實際出現可填問卷
         v1.6.2：輪詢 12 秒等 frame 載入
-        v1.8.2：偵測到「修改問卷／查看問卷／已填寫」立刻 return False（已填過、不空等）
+        v1.8.3：偵測到「修改問卷／查看問卷／已填寫」立刻 return False（已填過、不空等）
         """
         if not self._try_jump_to_sysbar_link(
                 ["問卷/評價", "問卷", "questionnaire"], "問卷/評價"):
             return False
         for i in range(12):
             self._human_sleep(1.0, 0.2)
-            # v1.8.2：問卷已填 → 立刻離開
+            # v1.8.3：問卷已填 → 立刻離開
             if self._survey_already_done():
                 self.log(f"⏭ 問卷已填寫（第{i+1}秒偵測到「修改問卷／查看問卷」），跳過不空等")
                 return False
@@ -2579,7 +2579,7 @@ class EClassApp:
 
     def _harvest_from_result_page(self):
         """從測驗結果頁拔正解寫進 qa_bank。回傳 (新增題數, 結構化結果 list)。
-        v1.8.2：每次失敗都呼叫，累積學習。"""
+        v1.8.3：每次失敗都呼叫，累積學習。"""
         course = getattr(self, "_current_course_title", "") or ""
         # 1) 試著點「查看作答」按鈕（有些頁面預設不展開）
         self._try_click_show_answers()
@@ -2657,7 +2657,7 @@ class EClassApp:
         return n_added, all_results
 
     def _extract_correct_in_current_frame(self):
-        """v1.8.2 在當前 frame 用 JS 抓「題目 + 正解選項」list。
+        """v1.8.3 在當前 frame 用 JS 抓「題目 + 正解選項」list。
         多策略偵測正解：class/text/icon/style。
         """
         try:
@@ -2968,7 +2968,7 @@ class EClassApp:
             pass
 
     def _dump_failed_page(self, attempt):
-        """v1.8.2：失敗後 dump 整份頁面 source + 截圖，方便分析有沒有藏正解"""
+        """v1.8.3：失敗後 dump 整份頁面 source + 截圖，方便分析有沒有藏正解"""
         try:
             ts = time.strftime("%Y%m%d_%H%M%S")
             course = (getattr(self, "_current_course_title", "") or "exam")
@@ -3015,7 +3015,7 @@ class EClassApp:
             self.log(f"⚠ dump 失敗：{e}")
 
     def _auto_take_exam(self, max_retries=30):
-        """v1.8.2：跨 frame + 新視窗 + 失敗自動重考
+        """v1.8.3：跨 frame + 新視窗 + 失敗自動重考
         停止條件（任一觸發）：
           1. 通過 (pass)
           2. 系統作答次數已達上限 (_exam_attempts_exhausted)
@@ -3199,7 +3199,7 @@ class EClassApp:
         return ""
 
     def _cleanup_qtext(self, text):
-        """v1.8.2：移除題型 / 配分 / 題號 / whitespace（題庫 key 用）"""
+        """v1.8.3：移除題型 / 配分 / 題號 / whitespace（題庫 key 用）"""
         if not text:
             return ""
         try:
@@ -3213,7 +3213,7 @@ class EClassApp:
         return text
 
     def _get_question_text(self, input_el):
-        """v1.8.2：終極版 — 從 input 往前 DOM-walk 收集文字，遇到上一題 input 停
+        """v1.8.3：終極版 — 從 input 往前 DOM-walk 收集文字，遇到上一題 input 停
         痞客幫 / E等公務園 的試題結構通常是：
             <tr>題目1...</tr>
             <tr><input name=A1></tr>...
@@ -3382,7 +3382,7 @@ class EClassApp:
         return False
 
     def _switch_to_question_frame(self):
-        """v1.8.2：點完「開始作答」後，主動切到含 radio/checkbox 的 frame。
+        """v1.8.3：點完「開始作答」後，主動切到含 radio/checkbox 的 frame。
         在主 document 沒有 input 時，逐個 frame 搜尋。回傳是否有切過。"""
         try:
             self.driver.switch_to.default_content()
@@ -3430,13 +3430,13 @@ class EClassApp:
         return False
 
     def _auto_answer_exam_questions(self):
-        """v1.8.2：題庫 + 押題（含 cycling 不重複）
+        """v1.8.3：題庫 + 押題（含 cycling 不重複）
         - 主動切 frame
         - 等 input 載入後再抓
         - 抓不到題目文字時 dump 第一題 outerHTML 至 LOG（debug）
         """
         try:
-            # v1.8.2：先切到含 input 的 frame
+            # v1.8.3：先切到含 input 的 frame
             switched = self._switch_to_question_frame()
             if switched:
                 self.log("🔀 切換到含試題 input 的 frame")
@@ -3463,7 +3463,7 @@ class EClassApp:
             n_db_hit  = 0
             n_fallback = 0
 
-            # v1.8.2：debug dump — 第一次出現 empty qtext 時記錄 input HTML
+            # v1.8.3：debug dump — 第一次出現 empty qtext 時記錄 input HTML
             _dumped = False
             def _debug_dump_input(inp_el):
                 nonlocal _dumped
@@ -3550,7 +3550,7 @@ class EClassApp:
 
     @staticmethod
     def _options_signature(opts):
-        """v1.8.2：用選項標籤組合做 key（跨 attempt 穩定，題目順序、id 都會變）"""
+        """v1.8.3：用選項標籤組合做 key（跨 attempt 穩定，題目順序、id 都會變）"""
         labs = sorted([(QABank.normalize(lab) or "")
                        for _i, lab, _t in opts if lab])
         if not labs:
@@ -3599,7 +3599,7 @@ class EClassApp:
 
     @staticmethod
     def _question_polarity(qtext):
-        """v1.8.2：題目語意極性
+        """v1.8.3：題目語意極性
             'neg' = 找錯的（下列何者錯誤 / 為非 / 不正確 / 何者錯）
             'pos' = 找對的（下列何者正確 / 為是 / 何者對 / 為真）
             ''    = 不確定（含抓不到題目文字）
@@ -3625,7 +3625,7 @@ class EClassApp:
         return ""
 
     def _fallback_answer_group(self, opts, qtext=""):
-        """v1.8.2 押題策略（即使抓不到題目文字也能跑）：
+        """v1.8.3 押題策略（即使抓不到題目文字也能跑）：
         1. 「以上皆是」優先（單選＆多選都適用）
         2. 題目極性 + 絕對化字眼：
            - 找錯題型 + 含「一定/絕對」 → 那個就是答案
@@ -3773,7 +3773,7 @@ class EClassApp:
 
     def _auto_fill_player_survey(self):
         """在播放器內自動填問卷/評價（v1.6.2：跨 frame + 新視窗）
-        v1.8.2：開頭快速偵測「修改問卷」狀態 → 立刻離開（不空等、不重複送）
+        v1.8.3：開頭快速偵測「修改問卷」狀態 → 立刻離開（不空等、不重複送）
         """
         try:
             try:
@@ -3781,7 +3781,7 @@ class EClassApp:
             except Exception:
                 pass
 
-            # v1.8.2：第一道關卡 — 已填過就直接走
+            # v1.8.3：第一道關卡 — 已填過就直接走
             if self._survey_already_done():
                 self.log("⏭ 問卷已填寫（修改問卷／查看問卷），直接進下一門")
                 return
@@ -3793,7 +3793,7 @@ class EClassApp:
                     self.log("跳問卷頁失敗或問卷已填，放棄自動填問卷")
                     return
 
-            # v1.8.2：第二道關卡 — 跳到問卷頁後再確認一次
+            # v1.8.3：第二道關卡 — 跳到問卷頁後再確認一次
             if self._survey_already_done():
                 self.log("⏭ 問卷頁顯示已填寫，跳過")
                 return
@@ -3924,7 +3924,7 @@ class EClassApp:
             self.log(f"存 qa_missed.json 失敗：{e}")
 
     def _print_session_stats(self):
-        """v1.8.2：印出本次執行累積統計"""
+        """v1.8.3：印出本次執行累積統計"""
         try:
             s = self._stats or {}
             self.log("══ 本次執行統計 ══")
