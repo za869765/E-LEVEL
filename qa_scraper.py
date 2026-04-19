@@ -37,21 +37,36 @@ INDEX_CACHE_TTL = 30 * 86400   # 30 天
 
 
 # ── 編碼工具 ────────────────────────────────────────────
+def _cjk_hit_ratio(s):
+    """回傳字串中 CJK 中文字符占非空白字元的比例（0~1）。
+    用來判定 decode 結果是否「讀得出中文」，比 try/except 可靠。"""
+    if not s:
+        return 0.0
+    non_ws = [c for c in s if not c.isspace()]
+    if not non_ws:
+        return 0.0
+    cjk = sum(1 for c in non_ws if "\u4e00" <= c <= "\u9fff")
+    return cjk / len(non_ws)
+
+
 def smart_decode(raw_bytes):
     """痞客幫頁面：頭部宣告 UTF-8 但中文 body 是 Big5。
-    策略：先試 UTF-8（替換錯誤）→ 若中文不可讀比例高 → 改用 Big5
+    bug #39: 原本「先試 UTF-8 strict 成功就回傳」邏輯反了。
+      - Big5 bytes 有時能通過 UTF-8 strict（罕見但會發生），結果亂碼仍回傳
+      - 反過來，若 Big5 decode 出更多可讀中文 → 那才是對的編碼
+    新策略：兩種都試（以 replace 模式），比較 CJK 中文字元命中率高者。
     """
-    try:
-        s_utf8 = raw_bytes.decode("utf-8", "strict")
-        # 全成功 → utf-8
-        return s_utf8
-    except UnicodeDecodeError:
-        pass
-    # 大部份位元無法用 UTF-8 → 改用 Big5
-    try:
-        return raw_bytes.decode("big5", "replace")
-    except Exception:
+    candidates = []
+    for enc in ("utf-8", "big5"):
+        try:
+            decoded = raw_bytes.decode(enc, "replace")
+        except Exception:
+            continue
+        candidates.append((_cjk_hit_ratio(decoded), enc, decoded))
+    if not candidates:
         return raw_bytes.decode("utf-8", "replace")
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][2]
 
 
 def http_get(url, timeout=15):

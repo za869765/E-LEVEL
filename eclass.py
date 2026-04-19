@@ -87,6 +87,10 @@ class QABank:
         self.path = path
         self.data = {}
         self._dirty = False
+        # bug #41: prefetch worker 用 ThreadPoolExecutor(max_workers=4) 並行改 self.data，
+        # 同時 save()/find() 可能在另一 thread 執行 → 產生 `dictionary changed size during iteration`
+        # 或寫出損毀的 JSON。加 RLock 保護所有讀寫。
+        self._lock = threading.RLock()
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
@@ -116,41 +120,75 @@ class QABank:
         key = self.normalize(question_text)
         if not key:
             return None
-        # 完全比對
-        if key in self.data:
-            return self.data[key]
-        # 模糊比對（短題目可能正規化後互為前後綴）
-        for k, v in self.data.items():
-            if len(k) >= 12 and (k in key or key in k):
-                return v
-        return None
+        with self._lock:
+            # 完全比對
+            if key in self.data:
+                return self.data[key]
+            # bug #43: 原本只要 len(k) >= 12 且互為子字串就回傳，太寬：
+            #   題庫「公務人員應遵守保密義務不得洩漏機密資料」會被「公務人員應遵守保密義務」（前綴）誤配。
+            # 改為：長度差距比例 < 0.25 + difflib ratio > 0.88 才視為同題。
+            try:
+                import difflib
+                ratio_fn = difflib.SequenceMatcher
+            except Exception:
+                ratio_fn = None
+            best = None
+            best_score = 0.0
+            for k, v in self.data.items():
+                if len(k) < 12:
+                    continue
+                longer, shorter = (k, key) if len(k) >= len(key) else (key, k)
+                if longer == 0 or shorter not in longer:
+                    # 互為子字串才有資格競爭 fuzzy
+                    if not (k in key or key in k):
+                        continue
+                len_ratio = len(shorter) / max(1, len(longer))
+                if len_ratio < 0.75:
+                    continue
+                if ratio_fn is not None:
+                    sim = ratio_fn(None, k, key).ratio()
+                    if sim < 0.88:
+                        continue
+                    if sim > best_score:
+                        best_score = sim
+                        best = v
+                else:
+                    best = v
+            return best
 
     def add(self, question_text, answers, qtype="SC", course=""):
         """新增/更新一題"""
         key = self.normalize(question_text)
         if not key:
             return
-        self.data[key] = {
-            "q": question_text[:300],
-            "type": qtype,
-            "a": list(answers) if isinstance(answers, (list, tuple)) else [answers],
-            "course": course or "",
-        }
-        self._dirty = True
+        with self._lock:
+            self.data[key] = {
+                "q": question_text[:300],
+                "type": qtype,
+                "a": list(answers) if isinstance(answers, (list, tuple)) else [answers],
+                "course": course or "",
+            }
+            self._dirty = True
 
     def save(self):
-        if not self._dirty:
-            return
+        with self._lock:
+            if not self._dirty:
+                return
+            # 於 lock 內 snapshot 資料，避免在寫檔期間其他 thread 繼續改 self.data 造成 JSON 損毀
+            snapshot = dict(self.data)
+            self._dirty = False
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-            self._dirty = False
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            # 寫失敗 → 再次標 dirty 讓下次重試
+            with self._lock:
+                self._dirty = True
 
     def count(self):
-        return len(self.data)
+        with self._lock:
+            return len(self.data)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1865,21 +1903,48 @@ class EClassApp:
         except Exception:
             pass
         # 2. 頁面內驗證彈窗（按確定/繼續/繼續上課）
-        confirm_texts = ["繼續上課", "繼續學習", "繼續", "確認", "我在",
-                         "確定", "仍在上課", "確認在線", "繼續觀看", "OK"]
-        for text in confirm_texts:
+        # bug #42:
+        #   原本用 contains(normalize-space(),'X') + 短 token "OK"/"繼續"/"確定"，
+        #   會誤觸 "Book"、"取消繼續"、"離開" 等反向按鈕。
+        #   改為：
+        #     (1) 長 token 用 contains
+        #     (2) 短 token 改 normalize-space()='X' 完全相等
+        #     (3) 加排除清單避免 "取消"/"離開"/"關閉"
+        long_phrases = ["繼續上課", "繼續學習", "仍在上課", "確認在線",
+                        "繼續觀看"]
+        exact_words  = ["繼續", "確認", "確定", "我在", "OK"]
+        bad_words    = ["取消", "離開", "關閉", "回上一頁", "結束"]
+        elem_filter = ("(self::button or self::a or self::input[@type='button'] "
+                       "or self::input[@type='submit'])")
+
+        def _try_click(xpath, label):
             try:
-                btns = self.driver.find_elements(By.XPATH,
-                    f"//*[contains(normalize-space(),'{text}') and "
-                    f"(self::button or self::a or self::input[@type='button'] "
-                    f"or self::input[@type='submit'])]")
+                btns = self.driver.find_elements(By.XPATH, xpath)
                 for btn in btns:
-                    if btn.is_displayed():
-                        self.driver.execute_script("arguments[0].click()", btn)
-                        self.log(f"已回應驗證彈窗：{text}")
-                        return True
+                    if not btn.is_displayed():
+                        continue
+                    text_norm = (btn.text or btn.get_attribute("value") or "").strip()
+                    if any(bw in text_norm for bw in bad_words):
+                        continue
+                    self.driver.execute_script("arguments[0].click()", btn)
+                    self.log(f"已回應驗證彈窗：{label} (按鈕文字：{text_norm[:20]})")
+                    return True
             except Exception:
                 pass
+            return False
+
+        for text in long_phrases:
+            if _try_click(
+                f"//*[contains(normalize-space(),'{text}') and {elem_filter}]",
+                text,
+            ):
+                return True
+        for text in exact_words:
+            if _try_click(
+                f"//*[normalize-space()='{text}' and {elem_filter}]",
+                text,
+            ):
+                return True
         return False
 
     def _learning_loop(self, required_minutes=0):
@@ -1940,7 +2005,7 @@ class EClassApp:
 
             if local_cycle % check_every == 0:
                 self.log("檢查上課時數...")
-                in_player = "mohw.elearn.hrd.gov.tw" in self.driver.current_url
+                in_player = "elearn.hrd.gov.tw" in self.driver.current_url
                 if not in_player:
                     try:
                         self.driver.refresh()
@@ -1953,7 +2018,7 @@ class EClassApp:
                     return
 
             # 播放器內最多 50 次循環後返回，繼續做測驗/問卷
-            if "mohw.elearn.hrd.gov.tw" in self.driver.current_url and local_cycle >= 50:
+            if "elearn.hrd.gov.tw" in self.driver.current_url and local_cycle >= 50:
                 self.log("播放器上課循環已達上限，準備進行測驗和問卷")
                 return
 
