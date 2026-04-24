@@ -1,5 +1,5 @@
 """
-E等公務園 自動上課輔助工具 v1.8.7
+E等公務園 自動上課輔助工具 v1.8.8
 - 自動管理瀏覽器驅動版本（永遠不會版本不符）
 - 支援 E等公務人員（我的e政府）/ 人事服務網eCPA 登入
 - 多組帳號記憶與快速切換
@@ -16,6 +16,12 @@ E等公務園 自動上課輔助工具 v1.8.7
      —「學習」= harvester 收成 + cycling 新排除錯選項
    * 本次執行統計（含 options_eliminated）
    * 問卷快速跳出：偵測「修改問卷／查看問卷」立刻 return，不空等
+- v1.8.8：Gemini AI 答題 ⭐ 痞客幫無此課時的第二道防線
+   * 題庫 miss → 呼叫 Google Gemini API（免費版 gemini-1.5-flash）
+   * 傳送「課程名＋題目＋選項」，AI 直接判斷正解
+   * 命中後立即寫入 qa_bank，下次同題直接命中不再呼叫 API
+   * API key 存於 eclass_config.json（gemini_api_key 欄位）
+   * 超額（429）時自動停用本 session，不影響押題 fallback
 """
 
 import tkinter as tk
@@ -52,7 +58,11 @@ except Exception as _e:
     _SCRAPER_AVAILABLE = False
     _SCRAPER_IMPORT_ERR = str(_e)
 
-VERSION = "1.8.7"
+# v1.8.8：Gemini AI 答題（用 urllib 直連 REST API，避免 SDK 啟動拖慢）
+GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
+                  "models/gemini-1.5-flash:generateContent")
+
+VERSION = "1.8.8"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -227,6 +237,7 @@ class EClassApp:
         self.popup_pending_survey = -1
         self.config   = self._load_config()
         self.qa_bank  = QABank(QA_BANK_FILE)
+        self._gemini  = None              # v1.8.8: Gemini AI client
         self._current_course_title = ""   # 答題自動學習用
         # 累計本次執行所有「題庫沒命中」題目，stop 時 dump 到 qa_missed.json
         self._missed_questions = {}
@@ -241,6 +252,7 @@ class EClassApp:
             "courses_attempted": 0, "courses_passed": 0, "courses_failed": 0,
             "exam_attempts": 0, "exams_passed": 0,
             "questions_total": 0, "db_hits": 0, "fallbacks": 0,
+            "ai_hits": 0,       # v1.8.8: Gemini AI 答題命中
             "harvested_questions": 0, "options_eliminated": 0,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -250,6 +262,7 @@ class EClassApp:
         self._prefetch_lock   = threading.Lock()
         self._prefetch_thread = None
         self._prefetch_index  = None
+        self._init_gemini()   # v1.8.8
 
         self.root = tk.Tk()
         self.root.title(f"E等公務園 自動上課工具 v{VERSION}")
@@ -272,13 +285,92 @@ class EClassApp:
         return {"accounts": [], "last_account": "", "check_interval": 5}
 
     def _save_config(self):
-        cfg = {
-            "accounts":     self.config.get("accounts", []),
-            "last_account": self.account_var.get(),
-            "browser":      self.browser_type.get(),
-        }
+        # v1.8.8：保留所有未列舉欄位（如 gemini_api_key）避免被覆蓋
+        cfg = dict(self.config)
+        cfg["accounts"]     = self.config.get("accounts", [])
+        cfg["last_account"] = self.account_var.get()
+        cfg["browser"]      = self.browser_type.get()
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    # ── v1.8.8: Gemini AI (直連 REST API，零 SDK) ────────────
+
+    def _init_gemini(self):
+        key = self.config.get("gemini_api_key", "").strip()
+        if key:
+            self._gemini = key   # 單純存 key，呼叫時直接用 urllib
+
+    def _gemini_call(self, prompt, timeout=15):
+        """POST Gemini REST API。回傳 (text, http_status) 或 (None, status)。"""
+        body = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}]
+        }).encode("utf-8")
+        url = f"{GEMINI_API_URL}?key={self._gemini}"
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            cands = data.get("candidates") or []
+            if not cands:
+                return "", 200
+            parts = cands[0].get("content", {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts)
+            return text, 200
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="ignore")[:300]
+            except Exception:
+                body = ""
+            return None, (e.code, body)
+        except Exception as e:
+            return None, (0, str(e))
+
+    def _ask_ai(self, qtext, opts):
+        """v1.8.8: 呼叫 Gemini API 答題。回傳命中的 (inp, lab, itype) list。"""
+        if not self._gemini or not qtext:
+            return []
+        course = getattr(self, "_current_course_title", "") or ""
+        opt_lines = "\n".join(
+            f"{chr(65 + i)}. {lab}"
+            for i, (_, lab, _) in enumerate(opts) if lab
+        )
+        prompt = (
+            f"你是台灣公務員訓練考試的答題助手。\n"
+            f"課程：{course}\n"
+            f"題目：{qtext}\n"
+            f"選項：\n{opt_lines}\n\n"
+            f"請直接回答「正確選項的完整文字」，若有多個正解請每行一個，不要任何解釋。"
+        )
+        text, status = self._gemini_call(prompt)
+        if text is None:
+            code, body = status if isinstance(status, tuple) else (0, "")
+            if code in (429,) or "quota" in str(body).lower() \
+                    or "resource_exhausted" in str(body).lower():
+                self.log(f"⚠ Gemini 超額（本次停用）: HTTP {code}")
+                self._gemini = None
+            else:
+                self.log(f"⚠ Gemini 錯誤: HTTP {code} {body[:100] if body else ''}")
+            return []
+        if not text:
+            return []
+        matched = []
+        for inp, lab, itype in opts:
+            if not lab:
+                continue
+            lab_n = QABank.normalize(lab)
+            for line in text.splitlines():
+                line_clean = re.sub(r'^[（(]?[A-Da-d][)）.、]\s*', '',
+                                    line.strip())
+                line_n = QABank.normalize(line_clean)
+                if not line_n or len(line_n) < 2:
+                    continue
+                if (lab_n == line_n
+                        or (len(lab_n) >= 6 and lab_n in line_n)
+                        or (len(line_n) >= 6 and line_n in lab_n)):
+                    matched.append((inp, lab, itype))
+                    break
+        return matched
 
     # ── GUI 建構 ──────────────────────────────────────────
 
@@ -3656,6 +3748,7 @@ class EClassApp:
 
             n_total   = len(groups)
             n_db_hit  = 0
+            n_ai_hit  = 0   # v1.8.8：Gemini AI 命中
             n_fallback = 0
 
             # v1.8.7：debug dump — 第一次出現 empty qtext 時記錄 input HTML
@@ -3710,6 +3803,54 @@ class EClassApp:
                     else:
                         self.log(f"📚 題庫命中：{qshow}")
                 else:
+                    # v1.8.8：題庫 miss → 嘗試 Gemini AI 答題
+                    if qtext and self._gemini:
+                        ai_matched = self._ask_ai(qtext, opts)
+                        if ai_matched:
+                            itype0 = opts[0][2]
+                            clicked_any = False
+                            if itype0 == "radio":
+                                try:
+                                    self.driver.execute_script(
+                                        "arguments[0].click()", ai_matched[0][0])
+                                    clicked_any = True
+                                except Exception:
+                                    pass
+                            else:
+                                for i2, _l2, _t2 in opts:
+                                    try:
+                                        if i2.is_selected():
+                                            self.driver.execute_script(
+                                                "arguments[0].click()", i2)
+                                    except Exception:
+                                        pass
+                                for inp_m, _l, _t in ai_matched:
+                                    try:
+                                        self.driver.execute_script(
+                                            "arguments[0].click()", inp_m)
+                                        clicked_any = True
+                                    except Exception:
+                                        pass
+                            if clicked_any:
+                                n_ai_hit += 1
+                                mlabs = " | ".join(
+                                    [(l[:25] + "..." if len(l) > 25 else l)
+                                     for _i, l, _t in ai_matched])
+                                qshow2 = qtext[:50] + ("..." if len(qtext) > 50 else "")
+                                self.log(f"🤖 AI答題：{qshow2} → {mlabs}")
+                                try:
+                                    qtype_ai = ("MC" if opts[0][2] == "checkbox"
+                                                else ("TF" if len(opts) == 2 else "SC"))
+                                    self.qa_bank.add(
+                                        qtext,
+                                        [l for _i, l, _t in ai_matched],
+                                        qtype=qtype_ai,
+                                        course=getattr(self, "_current_course_title", ""))
+                                    self.qa_bank.save()
+                                except Exception:
+                                    pass
+                                continue   # 跳過 fallback
+
                     n_fallback += 1
                     self._fallback_answer_group(opts, qtext=qtext)
                     qshow = qtext[:60] + ("..." if len(qtext) > 60 else "")
@@ -3733,11 +3874,12 @@ class EClassApp:
                     else:
                         self.log(f"❓ 抓不到題目文字（name={name}）")
 
-            self.log(f"答題完成（{n_total} 題：題庫 {n_db_hit} / 押題 {n_fallback}）")
+            self.log(f"答題完成（{n_total} 題：題庫 {n_db_hit} / AI {n_ai_hit} / 押題 {n_fallback}）")
             try:
                 self._stats["questions_total"] += n_total
-                self._stats["db_hits"] += n_db_hit
-                self._stats["fallbacks"] += n_fallback
+                self._stats["db_hits"]         += n_db_hit
+                self._stats["ai_hits"]         += n_ai_hit
+                self._stats["fallbacks"]       += n_fallback
             except Exception:
                 pass
         except Exception as e:
@@ -4168,7 +4310,7 @@ class EClassApp:
             self.log(f"  起始：{s.get('started_at','')}")
             self.log(f"  課程：嘗試 {s.get('courses_attempted',0)}、過 {s.get('courses_passed',0)}、未過 {s.get('courses_failed',0)}")
             self.log(f"  測驗：總 attempt {s.get('exam_attempts',0)}、通過 {s.get('exams_passed',0)}")
-            self.log(f"  答題：總 {s.get('questions_total',0)} 題（題庫命中 {s.get('db_hits',0)} / 押題 {s.get('fallbacks',0)}）")
+            self.log(f"  答題：總 {s.get('questions_total',0)} 題（題庫 {s.get('db_hits',0)} / AI {s.get('ai_hits',0)} / 押題 {s.get('fallbacks',0)}）")
             self.log(f"  學習：harvester 收割 {s.get('harvested_questions',0)} 題")
             self.log(f"  目前題庫總量：{self.qa_bank.count()} 題")
             self.log(f"  未命中（待人工）：{len(self._missed_questions)} 題")
