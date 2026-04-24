@@ -23,9 +23,10 @@ from html import unescape
 from html.parser import HTMLParser
 
 INDEX_URL = "https://roddayeye.pixnet.net/blog/posts/15325785090"
+# v1.8.7: 與 eclass.py FIXED_USER_AGENT 同一字串，避免兩邊送出的 UA 不一致
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/120.0.0.0 Safari/537.36")
+      "Chrome/120.0.6099.109 Safari/537.36")
 HEADERS = {
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
