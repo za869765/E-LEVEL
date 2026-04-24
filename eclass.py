@@ -1,12 +1,12 @@
 """
-E等公務園 自動上課輔助工具 v1.8.3
+E等公務園 自動上課輔助工具 v1.8.4
 - 自動管理瀏覽器驅動版本（永遠不會版本不符）
 - 支援 E等公務人員（我的e政府）/ 人事服務網eCPA 登入
 - 多組帳號記憶與快速切換
 - 自動掃描未完成課程 → 循環上課 → 自動關彈窗
 - v1.8.0：登入後自動 prefetch 待考課程題庫（roddayeye 痞客幫）
 - v1.8.1：修「已填問卷誤點修改問卷」/「[ ] CSS selector 失敗」
-- v1.8.3：盲考生強化套件
+- v1.8.4：盲考生強化套件
    * 題目文字 reverse DOM walk（解決抓不到題目）
    * 押題：以上皆是優先 / 一定絕對排除 / TF 對否語意 / 多選預設全選
    * Cycling：失敗後絕不重蹈覆轍（option-label hash 跨 attempt 穩定）
@@ -52,7 +52,7 @@ except Exception as _e:
     _SCRAPER_AVAILABLE = False
     _SCRAPER_IMPORT_ERR = str(_e)
 
-VERSION = "1.8.3"
+VERSION = "1.8.4"
 # 打包成 exe 時用 sys.executable 定位，避免存到暫存目錄
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -137,11 +137,10 @@ class QABank:
             for k, v in self.data.items():
                 if len(k) < 12:
                     continue
+                # v1.8.4 bug #2: 原本 `longer == 0` 是死碼（string != 0），且嵌套 if 等於把候選
+                # 限制成必須互為子字串，閹割了 ratio fuzzy。改成：長度差距 >=25% 直接 skip，
+                # 其餘全交 difflib 判定。
                 longer, shorter = (k, key) if len(k) >= len(key) else (key, k)
-                if longer == 0 or shorter not in longer:
-                    # 互為子字串才有資格競爭 fuzzy
-                    if not (k in key or key in k):
-                        continue
                 len_ratio = len(shorter) / max(1, len(longer))
                 if len_ratio < 0.75:
                     continue
@@ -156,12 +155,18 @@ class QABank:
                     best = v
             return best
 
-    def add(self, question_text, answers, qtype="SC", course=""):
-        """新增/更新一題"""
+    def add(self, question_text, answers, qtype="SC", course="", overwrite=True):
+        """新增/更新一題
+        v1.8.4 bug #5：加 overwrite 參數（預設 True 保留原行為）。
+          harvester 從結果頁挖到正解 → upsert（高信任度）
+          prefetch 從痞客幫抓到 → add_if_absent（低信任度，不覆蓋既有）
+        """
         key = self.normalize(question_text)
         if not key:
             return
         with self._lock:
+            if (not overwrite) and key in self.data:
+                return
             self.data[key] = {
                 "q": question_text[:300],
                 "type": qtype,
@@ -169,6 +174,18 @@ class QABank:
                 "course": course or "",
             }
             self._dirty = True
+
+    def add_if_absent(self, question_text, answers, qtype="SC", course=""):
+        """v1.8.4 bug #5：prefetch 專用 — 既有就不覆蓋"""
+        return self.add(question_text, answers, qtype=qtype, course=course, overwrite=False)
+
+    def has_exact(self, question_text):
+        """v1.8.4 bug #4：精確比對（不走 fuzzy），供 harvester existing check 用"""
+        key = self.normalize(question_text)
+        if not key:
+            return False
+        with self._lock:
+            return key in self.data
 
     def save(self):
         with self._lock:
@@ -207,13 +224,13 @@ class EClassApp:
         self._current_course_title = ""   # 答題自動學習用
         # 累計本次執行所有「題庫沒命中」題目，stop 時 dump 到 qa_missed.json
         self._missed_questions = {}
-        # v1.8.3：選項 cycling — 記錄每題試過的選項，避免下一次重蹈覆轍
+        # v1.8.4：選項 cycling — 記錄每題試過的選項，避免下一次重蹈覆轍
         # key = options_signature  (依題目選項組合 hash，跨 attempt 穩定)
         # value = set of normalized option labels already tried
         self._exam_session_tried = {}
-        # v1.8.3：本次測驗的零學習計數（連續多次 attempt 無題庫成長 → 放棄）
+        # v1.8.4：本次測驗的零學習計數（連續多次 attempt 無題庫成長 → 放棄）
         self._exam_no_learn_streak = 0
-        # v1.8.3：執行期統計
+        # v1.8.4：執行期統計
         self._stats = {
             "courses_attempted": 0, "courses_passed": 0, "courses_failed": 0,
             "exam_attempts": 0, "exams_passed": 0,
@@ -1138,11 +1155,12 @@ class EClassApp:
                 if not qtext or not ans:
                     continue
                 n_total += 1
-                # 只在沒有時新增（避免覆蓋手工編輯）
-                if not self.qa_bank.find(qtext):
-                    self.qa_bank.add(qtext, ans, qtype=qtype, course=name)
+                # v1.8.4 bug #5：prefetch 用 add_if_absent（低信任，不覆蓋 harvester/手工答案）
+                before = self.qa_bank.has_exact(qtext)
+                self.qa_bank.add_if_absent(qtext, ans, qtype=qtype, course=name)
+                if not before:
                     n_added += 1
-            # v1.8.3：「題庫已備齊」也算 done，否則一直被當 miss
+            # v1.8.4：「題庫已備齊」也算 done，否則一直被當 miss
             has_answers = n_total > 0
             with self._prefetch_lock:
                 self._prefetch_status[k] = "done" if has_answers else "miss"
@@ -1190,7 +1208,7 @@ class EClassApp:
     def _on_stop(self):
         self.running = False
         self._set_status("已停止")
-        # v1.8.3：印統計
+        # v1.8.4：印統計
         try:
             self._print_session_stats()
         except Exception:
@@ -2305,7 +2323,7 @@ class EClassApp:
                 pass
 
     def _survey_already_done(self):
-        """v1.8.3：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
+        """v1.8.4：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
         看到任一 → 立刻 return True，主流程直接跳下一門課，不空等。
         """
         DONE_KEYS = ("修改問卷", "查看問卷", "查看結果", "已填寫", "已繳交",
@@ -2459,14 +2477,14 @@ class EClassApp:
     def _try_jump_to_survey_sysbar(self):
         """跳到「問卷/評價」頁，回傳是否實際出現可填問卷
         v1.6.2：輪詢 12 秒等 frame 載入
-        v1.8.3：偵測到「修改問卷／查看問卷／已填寫」立刻 return False（已填過、不空等）
+        v1.8.4：偵測到「修改問卷／查看問卷／已填寫」立刻 return False（已填過、不空等）
         """
         if not self._try_jump_to_sysbar_link(
                 ["問卷/評價", "問卷", "questionnaire"], "問卷/評價"):
             return False
         for i in range(12):
             self._human_sleep(1.0, 0.2)
-            # v1.8.3：問卷已填 → 立刻離開
+            # v1.8.4：問卷已填 → 立刻離開
             if self._survey_already_done():
                 self.log(f"⏭ 問卷已填寫（第{i+1}秒偵測到「修改問卷／查看問卷」），跳過不空等")
                 return False
@@ -2579,7 +2597,7 @@ class EClassApp:
 
     def _harvest_from_result_page(self):
         """從測驗結果頁拔正解寫進 qa_bank。回傳 (新增題數, 結構化結果 list)。
-        v1.8.3：每次失敗都呼叫，累積學習。"""
+        v1.8.4：每次失敗都呼叫，累積學習。"""
         course = getattr(self, "_current_course_title", "") or ""
         # 1) 試著點「查看作答」按鈕（有些頁面預設不展開）
         self._try_click_show_answers()
@@ -2644,9 +2662,11 @@ class EClassApp:
             if not key or key in seen_keys:
                 continue
             seen_keys.add(key)
-            existing = self.qa_bank.find(q)
-            if existing and existing.get("a"):
-                continue   # 已有答案，不覆蓋
+            # v1.8.4 bug #4: 用 has_exact（精確比對）而非 fuzzy find —
+            #   避免「題庫有前綴/超集相似題」就跳過，結果不同題的真正正解永遠學不到
+            if self.qa_bank.has_exact(q):
+                continue   # 此題在題庫已有 exact key，不覆蓋
+            # harvester 是高信任（真正結果頁），用 overwrite=True（預設）
             self.qa_bank.add(q, answers, qtype=qtype, course=course)
             n_added += 1
         if n_added > 0:
@@ -2657,7 +2677,7 @@ class EClassApp:
         return n_added, all_results
 
     def _extract_correct_in_current_frame(self):
-        """v1.8.3 在當前 frame 用 JS 抓「題目 + 正解選項」list。
+        """v1.8.4 在當前 frame 用 JS 抓「題目 + 正解選項」list。
         多策略偵測正解：class/text/icon/style。
         """
         try:
@@ -2674,8 +2694,26 @@ class EClassApp:
                             return true;
                         }
                         var sty = (anc.getAttribute && anc.getAttribute('style') || '').toLowerCase();
-                        if (/(color\s*:\s*(green|#0[a-f0-9]?[a-f0-9]?[a-f0-9]?[a-f0-9]?)|color\s*:\s*rgb\(\s*0\s*,\s*1?\d{0,2}\s*,\s*0)/.test(sty)) {
-                            // 純綠色多半是正解標
+                        // v1.8.4 bug #1: 原本 #0[a-f0-9]?…? 讓純黑 #000/#000000 也被當正解；
+                        //   rgb(0, 1?\d{0,2}, 0) 也 match rgb(0,0,0)。結果題庫被黑字選項污染。
+                        //   改用嚴格綠判定：hex G channel >=8 且 R/B <=4；rgb G >=120 且 R/B <=80
+                        var hexMatch = sty.match(/color\s*:\s*#([0-9a-f]{3,6})\b/);
+                        var rgbMatch = sty.match(/color\s*:\s*rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/);
+                        var greenNamed = /color\s*:\s*(green|lime|limegreen|darkgreen|forestgreen|mediumseagreen|seagreen)\b/.test(sty);
+                        var isGreenStyle = greenNamed;
+                        if (!isGreenStyle && hexMatch) {
+                            var hx = hexMatch[1];
+                            var r,g,b;
+                            if (hx.length === 3) { r=parseInt(hx[0]+hx[0],16); g=parseInt(hx[1]+hx[1],16); b=parseInt(hx[2]+hx[2],16); }
+                            else if (hx.length === 6) { r=parseInt(hx.slice(0,2),16); g=parseInt(hx.slice(2,4),16); b=parseInt(hx.slice(4,6),16); }
+                            else { r=g=b=0; }
+                            isGreenStyle = (g >= 128 && r <= 80 && b <= 80);
+                        }
+                        if (!isGreenStyle && rgbMatch) {
+                            var rr=parseInt(rgbMatch[1],10), gg=parseInt(rgbMatch[2],10), bb=parseInt(rgbMatch[3],10);
+                            isGreenStyle = (gg >= 128 && rr <= 80 && bb <= 80);
+                        }
+                        if (isGreenStyle) {
                             return true;
                         }
                         anc = anc.parentElement;
@@ -2967,13 +3005,88 @@ class EClassApp:
         except Exception:
             pass
 
+    # v1.8.4 bug #6: 敏感欄位 scrub + size cap + rolling delete
+    _DUMP_MAX_BYTES = 2 * 1024 * 1024  # 每份 frame html 最多 2MB
+    _DUMP_MAX_KEEP  = 5                 # 最多保留最近 5 組 debug_fail_* dump
+
+    @staticmethod
+    def _scrub_sensitive_html(html):
+        """移除常見敏感欄位（session/token/csrf/password/身分證等）再寫檔"""
+        if not html:
+            return html
+        try:
+            # hidden/visible input 含敏感 name → value 洗掉
+            html = re.sub(
+                r'(<input[^>]*\bname\s*=\s*["\'](?:[^"\']*(?:password|passwd|pwd|csrf|token|session|auth|bearer|api[_-]?key|secret|id_no|idcard|身分證)[^"\']*)["\'][^>]*\bvalue\s*=\s*)["\'][^"\']*["\']',
+                r'\1"[REDACTED]"', html, flags=re.IGNORECASE)
+            # JS var assignment 格式
+            html = re.sub(
+                r'(\b(?:token|csrf|session|authorization|bearer|apiKey|secret)\b\s*[:=]\s*)(["\'])[^"\']{4,}\2',
+                r'\1\2[REDACTED]\2', html, flags=re.IGNORECASE)
+            # meta csrf
+            html = re.sub(
+                r'(<meta[^>]*\bname\s*=\s*["\'](?:csrf-token|x-csrf-token)["\'][^>]*\bcontent\s*=\s*)["\'][^"\']*["\']',
+                r'\1"[REDACTED]"', html, flags=re.IGNORECASE)
+            # Cookie header in script / comments
+            html = re.sub(r'(cookie\s*[:=]\s*)(["\'])[^"\']+\2',
+                          r'\1\2[REDACTED]\2', html, flags=re.IGNORECASE)
+        except Exception:
+            pass
+        return html
+
+    def _rotate_debug_dumps(self):
+        """保留最近 N 組 dump，較舊的刪掉"""
+        try:
+            files = [f for f in os.listdir(_DATA_DIR)
+                     if f.startswith("debug_fail_")]
+            # 以 mtime 倒排（新→舊）
+            files.sort(key=lambda f: os.path.getmtime(os.path.join(_DATA_DIR, f)),
+                       reverse=True)
+            # 用「課名+時間戳」的前綴分組，保留最新 N 組
+            seen_groups = set()
+            to_delete = []
+            for f in files:
+                # 例：debug_fail_CRPD第2講_20260120_143022_a3_main.html
+                m = re.match(r'(debug_fail_.+?_\d{8}_\d{6}_a\d+)', f)
+                grp = m.group(1) if m else f
+                if grp in seen_groups:
+                    continue
+                if len(seen_groups) >= self._DUMP_MAX_KEEP:
+                    to_delete.append(f)
+                    continue
+                seen_groups.add(grp)
+            # 保留的同組其他檔不刪；只刪超出組別的
+            for grp in list(seen_groups)[self._DUMP_MAX_KEEP:]:
+                for f in files:
+                    if f.startswith(grp):
+                        to_delete.append(f)
+            for f in to_delete:
+                try:
+                    os.remove(os.path.join(_DATA_DIR, f))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _dump_failed_page(self, attempt):
-        """v1.8.3：失敗後 dump 整份頁面 source + 截圖，方便分析有沒有藏正解"""
+        """v1.8.4：失敗後 dump 整份頁面 source + 截圖，方便分析有沒有藏正解
+        v1.8.4 bug #6: 洗敏感欄位 + 每份 ≤2MB + 最多保留最近 5 組"""
         try:
             ts = time.strftime("%Y%m%d_%H%M%S")
             course = (getattr(self, "_current_course_title", "") or "exam")
             safe_course = re.sub(r'[\\/:*?"<>|\s]+', "_", course)[:40]
             base = os.path.join(_DATA_DIR, f"debug_fail_{safe_course}_{ts}_a{attempt}")
+
+            def _write_capped(path, html):
+                if not html:
+                    return
+                scrubbed = self._scrub_sensitive_html(html)
+                # 超過上限先警告再截斷
+                if len(scrubbed.encode('utf-8', errors='ignore')) > self._DUMP_MAX_BYTES:
+                    scrubbed = scrubbed[:self._DUMP_MAX_BYTES] + \
+                               "\n\n[... TRUNCATED at 2MB for privacy ...]"
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(scrubbed)
 
             # 主 document
             try:
@@ -2981,9 +3094,7 @@ class EClassApp:
             except Exception:
                 pass
             try:
-                src = self.driver.page_source or ""
-                with open(base + "_main.html", "w", encoding="utf-8") as f:
-                    f.write(src)
+                _write_capped(base + "_main.html", self.driver.page_source or "")
             except Exception:
                 pass
 
@@ -2993,9 +3104,8 @@ class EClassApp:
                     try:
                         self.driver.switch_to.default_content()
                         self.driver.switch_to.frame(fr)
-                        s = self.driver.page_source or ""
-                        with open(f"{base}_frame{i}.html", "w", encoding="utf-8") as f:
-                            f.write(s)
+                        _write_capped(f"{base}_frame{i}.html",
+                                      self.driver.page_source or "")
                     except Exception:
                         pass
             finally:
@@ -3010,12 +3120,14 @@ class EClassApp:
             except Exception:
                 pass
 
-            self.log(f"🔍 失敗頁已存：{os.path.basename(base)}_*.html / .png")
+            # 保留最近 N 組，刪舊
+            self._rotate_debug_dumps()
+            self.log(f"🔍 失敗頁已存（已洗敏感 / 每份≤2MB）：{os.path.basename(base)}_*.html / .png")
         except Exception as e:
             self.log(f"⚠ dump 失敗：{e}")
 
     def _auto_take_exam(self, max_retries=30):
-        """v1.8.3：跨 frame + 新視窗 + 失敗自動重考
+        """v1.8.4：跨 frame + 新視窗 + 失敗自動重考
         停止條件（任一觸發）：
           1. 通過 (pass)
           2. 系統作答次數已達上限 (_exam_attempts_exhausted)
@@ -3199,7 +3311,7 @@ class EClassApp:
         return ""
 
     def _cleanup_qtext(self, text):
-        """v1.8.3：移除題型 / 配分 / 題號 / whitespace（題庫 key 用）"""
+        """v1.8.4：移除題型 / 配分 / 題號 / whitespace（題庫 key 用）"""
         if not text:
             return ""
         try:
@@ -3213,7 +3325,7 @@ class EClassApp:
         return text
 
     def _get_question_text(self, input_el):
-        """v1.8.3：終極版 — 從 input 往前 DOM-walk 收集文字，遇到上一題 input 停
+        """v1.8.4：終極版 — 從 input 往前 DOM-walk 收集文字，遇到上一題 input 停
         痞客幫 / E等公務園 的試題結構通常是：
             <tr>題目1...</tr>
             <tr><input name=A1></tr>...
@@ -3382,7 +3494,7 @@ class EClassApp:
         return False
 
     def _switch_to_question_frame(self):
-        """v1.8.3：點完「開始作答」後，主動切到含 radio/checkbox 的 frame。
+        """v1.8.4：點完「開始作答」後，主動切到含 radio/checkbox 的 frame。
         在主 document 沒有 input 時，逐個 frame 搜尋。回傳是否有切過。"""
         try:
             self.driver.switch_to.default_content()
@@ -3430,13 +3542,13 @@ class EClassApp:
         return False
 
     def _auto_answer_exam_questions(self):
-        """v1.8.3：題庫 + 押題（含 cycling 不重複）
+        """v1.8.4：題庫 + 押題（含 cycling 不重複）
         - 主動切 frame
         - 等 input 載入後再抓
         - 抓不到題目文字時 dump 第一題 outerHTML 至 LOG（debug）
         """
         try:
-            # v1.8.3：先切到含 input 的 frame
+            # v1.8.4：先切到含 input 的 frame
             switched = self._switch_to_question_frame()
             if switched:
                 self.log("🔀 切換到含試題 input 的 frame")
@@ -3463,7 +3575,7 @@ class EClassApp:
             n_db_hit  = 0
             n_fallback = 0
 
-            # v1.8.3：debug dump — 第一次出現 empty qtext 時記錄 input HTML
+            # v1.8.4：debug dump — 第一次出現 empty qtext 時記錄 input HTML
             _dumped = False
             def _debug_dump_input(inp_el):
                 nonlocal _dumped
@@ -3549,18 +3661,22 @@ class EClassApp:
             self.log(f"自動答題失敗: {e}")
 
     @staticmethod
-    def _options_signature(opts):
-        """v1.8.3：用選項標籤組合做 key（跨 attempt 穩定，題目順序、id 都會變）"""
+    def _options_signature(opts, qtext=""):
+        """v1.8.4：用選項標籤組合做 key（跨 attempt 穩定，題目順序、id 都會變）
+        v1.8.4 bug #3：加入 qtext。原本只 hash labels → TF 題全部共用「對/錯」signature，
+        一題試過「對」後所有 TF 題的 tried set 都卡死，cycling 等於沒用。"""
         labs = sorted([(QABank.normalize(lab) or "")
                        for _i, lab, _t in opts if lab])
         if not labs:
             return ""
+        q_norm = QABank.normalize(qtext or "")
         try:
             import hashlib
-            h = hashlib.md5(("\u0001".join(labs)).encode("utf-8")).hexdigest()[:16]
+            combined = (q_norm + "\u0001" + "\u0001".join(labs)).encode("utf-8")
+            h = hashlib.md5(combined).hexdigest()[:16]
             return h
         except Exception:
-            return "|".join(labs)[:120]
+            return (q_norm[:40] + "|" + "|".join(labs))[:160]
 
     # 「以上皆是」/「以上皆非」常見變體
     _ALL_ABOVE_KEYS  = ("以上皆是", "以上皆對", "以上皆正確", "全部皆是",
@@ -3570,10 +3686,13 @@ class EClassApp:
                         "以上都不是", "上述都不對", "前述皆非",
                         "none of the above")
     # 絕對化字眼 — 出現在選項裡通常是錯的；出現在 TF 題目通常答否
-    _ABSOLUTE_KEYS = ("一定", "絕對", "必定", "必然", "永遠", "從不",
-                      "絕不", "完全", "100%", "百分之百", "毫無例外",
-                      "所有的", "任何", "every", "always", "never",
-                      "absolutely", "definitely", "must")
+    # v1.8.4 bug #7：中文類用子字串比對、英文類需 \b word boundary 避免誤觸
+    # 例：`every` 子字串會命中 `everyone / everywhere`；`must` 命中 `must-have`；`all` 命中 `allergy/install`
+    _ABSOLUTE_KEYS_CJK = ("一定", "絕對", "必定", "必然", "永遠", "從不",
+                          "絕不", "完全", "100%", "百分之百", "毫無例外",
+                          "所有的", "任何")
+    _ABSOLUTE_KEYS_EN  = ("every", "always", "never",
+                          "absolutely", "definitely", "must")
 
     @classmethod
     def _is_all_above(cls, label):
@@ -3591,15 +3710,25 @@ class EClassApp:
 
     @classmethod
     def _has_absolute_word(cls, text):
-        """含「一定 / 絕對 / 必定 / 永遠」等絕對化字眼 → 通常是出題者埋的坑"""
+        """含「一定 / 絕對 / 必定 / 永遠」等絕對化字眼 → 通常是出題者埋的坑
+        v1.8.4 bug #7：中文子字串 OK、英文需 word boundary 避免誤觸 everyone/must-have"""
         if not text:
             return False
-        s = (text or "").lower().replace(" ", "")
-        return any(k.lower().replace(" ", "") in s for k in cls._ABSOLUTE_KEYS)
+        s_lower = text.lower()
+        s_no_space = s_lower.replace(" ", "")
+        # 中文：子字串比對
+        for k in cls._ABSOLUTE_KEYS_CJK:
+            if k.lower().replace(" ", "") in s_no_space:
+                return True
+        # 英文：word boundary
+        for k in cls._ABSOLUTE_KEYS_EN:
+            if re.search(r'\b' + re.escape(k) + r'\b', s_lower):
+                return True
+        return False
 
     @staticmethod
     def _question_polarity(qtext):
-        """v1.8.3：題目語意極性
+        """v1.8.4：題目語意極性
             'neg' = 找錯的（下列何者錯誤 / 為非 / 不正確 / 何者錯）
             'pos' = 找對的（下列何者正確 / 為是 / 何者對 / 為真）
             ''    = 不確定（含抓不到題目文字）
@@ -3625,7 +3754,7 @@ class EClassApp:
         return ""
 
     def _fallback_answer_group(self, opts, qtext=""):
-        """v1.8.3 押題策略（即使抓不到題目文字也能跑）：
+        """v1.8.4 押題策略（即使抓不到題目文字也能跑）：
         1. 「以上皆是」優先（單選＆多選都適用）
         2. 題目極性 + 絕對化字眼：
            - 找錯題型 + 含「一定/絕對」 → 那個就是答案
@@ -3637,7 +3766,8 @@ class EClassApp:
         if not opts:
             return
         itype = opts[0][2]
-        sig = self._options_signature(opts)
+        # v1.8.4 bug #3: 傳入 qtext，每題獨立 tried set，避免 TF 共用「對/錯」signature
+        sig = self._options_signature(opts, qtext=qtext or "")
         tried = self._exam_session_tried.setdefault(sig, set())
         polarity = self._question_polarity(qtext or "")
 
@@ -3773,7 +3903,7 @@ class EClassApp:
 
     def _auto_fill_player_survey(self):
         """在播放器內自動填問卷/評價（v1.6.2：跨 frame + 新視窗）
-        v1.8.3：開頭快速偵測「修改問卷」狀態 → 立刻離開（不空等、不重複送）
+        v1.8.4：開頭快速偵測「修改問卷」狀態 → 立刻離開（不空等、不重複送）
         """
         try:
             try:
@@ -3781,7 +3911,7 @@ class EClassApp:
             except Exception:
                 pass
 
-            # v1.8.3：第一道關卡 — 已填過就直接走
+            # v1.8.4：第一道關卡 — 已填過就直接走
             if self._survey_already_done():
                 self.log("⏭ 問卷已填寫（修改問卷／查看問卷），直接進下一門")
                 return
@@ -3793,7 +3923,7 @@ class EClassApp:
                     self.log("跳問卷頁失敗或問卷已填，放棄自動填問卷")
                     return
 
-            # v1.8.3：第二道關卡 — 跳到問卷頁後再確認一次
+            # v1.8.4：第二道關卡 — 跳到問卷頁後再確認一次
             if self._survey_already_done():
                 self.log("⏭ 問卷頁顯示已填寫，跳過")
                 return
@@ -3924,7 +4054,7 @@ class EClassApp:
             self.log(f"存 qa_missed.json 失敗：{e}")
 
     def _print_session_stats(self):
-        """v1.8.3：印出本次執行累積統計"""
+        """v1.8.4：印出本次執行累積統計"""
         try:
             s = self._stats or {}
             self.log("══ 本次執行統計 ══")
