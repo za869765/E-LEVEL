@@ -60,9 +60,10 @@ except Exception as _e:
 
 # v1.8.8：Gemini AI 答題（用 urllib 直連 REST API，避免 SDK 啟動拖慢）
 GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
-                  "models/gemini-flash-latest:generateContent")
+                  "models/gemini-flash-lite-latest:generateContent")
+GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.12"
+VERSION = "1.8.13"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -352,32 +353,58 @@ class EClassApp:
         key = self.config.get("gemini_api_key", "").strip()
         if key:
             self._gemini = key   # 單純存 key，呼叫時直接用 urllib
+        # v1.8.13: RPM 節流 + 連續 429 計數
+        self._gemini_last_call = 0.0
+        self._gemini_429_streak = 0
 
     def _gemini_call(self, prompt, timeout=15):
-        """POST Gemini REST API。回傳 (text, http_status) 或 (None, status)。"""
+        """POST Gemini REST API。回傳 (text, http_status) 或 (None, status)。
+        v1.8.13: 加 RPM 節流 + 503 重試一次"""
+        # RPM 節流
+        try:
+            elapsed = time.time() - self._gemini_last_call
+            if elapsed < GEMINI_MIN_INTERVAL:
+                time.sleep(GEMINI_MIN_INTERVAL - elapsed)
+        except Exception:
+            pass
+
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}]
         }).encode("utf-8")
         url = f"{GEMINI_API_URL}?key={self._gemini}"
-        req = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            cands = data.get("candidates") or []
-            if not cands:
-                return "", 200
-            parts = cands[0].get("content", {}).get("parts") or []
-            text = "".join(p.get("text", "") for p in parts)
-            return text, 200
-        except urllib.error.HTTPError as e:
+
+        def _do_call():
+            req = urllib.request.Request(url, data=body,
+                                         headers={"Content-Type": "application/json"})
             try:
-                body = e.read().decode("utf-8", errors="ignore")[:300]
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                cands = data.get("candidates") or []
+                if not cands:
+                    return "", 200
+                parts = cands[0].get("content", {}).get("parts") or []
+                text = "".join(p.get("text", "") for p in parts)
+                return text, 200
+            except urllib.error.HTTPError as e:
+                try:
+                    body_e = e.read().decode("utf-8", errors="ignore")[:300]
+                except Exception:
+                    body_e = ""
+                return None, (e.code, body_e)
+            except Exception as e:
+                return None, (0, str(e))
+
+        text, status = _do_call()
+        # 503 transient → 等 6 秒重試一次
+        if text is None and isinstance(status, tuple) and status[0] == 503:
+            try:
+                self.log("⚠ Gemini 503 high demand，6 秒後重試一次")
             except Exception:
-                body = ""
-            return None, (e.code, body)
-        except Exception as e:
-            return None, (0, str(e))
+                pass
+            time.sleep(6)
+            text, status = _do_call()
+        self._gemini_last_call = time.time()
+        return text, status
 
     def _ask_ai(self, qtext, opts):
         """v1.8.8: 呼叫 Gemini API 答題。回傳命中的 (inp, lab, itype) list。"""
@@ -398,13 +425,22 @@ class EClassApp:
         text, status = self._gemini_call(prompt)
         if text is None:
             code, body = status if isinstance(status, tuple) else (0, "")
-            if code in (429,) or "quota" in str(body).lower() \
-                    or "resource_exhausted" in str(body).lower():
-                self.log(f"⚠ Gemini 超額（本次停用）: HTTP {code}")
-                self._gemini = None
+            is_quota = (code == 429 or "quota" in str(body).lower()
+                        or "resource_exhausted" in str(body).lower())
+            if is_quota:
+                # v1.8.13: 連續兩次 429 才停用，第一次先等 30 秒
+                self._gemini_429_streak += 1
+                if self._gemini_429_streak >= 2:
+                    self.log(f"⚠ Gemini 連續超額兩次（本次停用）: HTTP {code}")
+                    self._gemini = None
+                else:
+                    self.log(f"⚠ Gemini 超額一次，等 30 秒後續用: HTTP {code}")
+                    time.sleep(30)
             else:
                 self.log(f"⚠ Gemini 錯誤: HTTP {code} {body[:100] if body else ''}")
             return []
+        # 成功回應 → reset 429 streak
+        self._gemini_429_streak = 0
         if not text:
             return []
         matched = []
