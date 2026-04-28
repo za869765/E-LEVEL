@@ -63,7 +63,7 @@ GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.14"
+VERSION = "1.8.15"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -1520,9 +1520,12 @@ class EClassApp:
                 need_exam   = (self.popup_pending_exam   > 0)
                 need_survey = (self.popup_pending_survey > 0)
                 if not (need_exam or need_survey):
-                    self.log(f"所有課程已完成！（未完成 {self.popup_pending_course} 門 / "
-                             f"補測驗 {self.popup_pending_exam} 個 / "
-                             f"補問卷 {self.popup_pending_survey} 份）")
+                    # v1.8.15: popup 數字是登入時的快照，不會隨通關更新。
+                    # 用本 session 實際統計取代誤導訊息。
+                    s = self._stats or {}
+                    self.log(f"所有課程已嘗試完畢（本 session 通過 {s.get('courses_passed',0)} 門 / "
+                             f"未過 {s.get('courses_failed',0)} 門 / "
+                             f"原始未完成 {self.popup_pending_course} 門）")
                     break
 
                 self.log(f"未完成課程已清空，掃描待補測驗 {self.popup_pending_exam} 個 / "
