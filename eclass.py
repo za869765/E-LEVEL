@@ -63,7 +63,7 @@ GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.13"
+VERSION = "1.8.14"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -444,19 +444,22 @@ class EClassApp:
         if not text:
             return []
         matched = []
+        # v1.8.14: 改用 _texts_match — TF 等價 + substring(>=2) + difflib 0.7
         for inp, lab, itype in opts:
             if not lab:
-                continue
-            lab_n = QABank.normalize(lab)
+                # v1.8.14: lab 抓不到時用 value 屬性（TF 題 radio 常 value=「對/錯」）
+                try:
+                    lab = (inp.get_attribute("value") or "").strip()
+                except Exception:
+                    lab = ""
+                if not lab:
+                    continue
             for line in text.splitlines():
                 line_clean = re.sub(r'^[（(]?[A-Da-d][)）.、]\s*', '',
                                     line.strip())
-                line_n = QABank.normalize(line_clean)
-                if not line_n or len(line_n) < 2:
+                if not line_clean:
                     continue
-                if (lab_n == line_n
-                        or (len(lab_n) >= 6 and lab_n in line_n)
-                        or (len(line_n) >= 6 and line_n in lab_n)):
+                if self._texts_match(lab, line_clean):
                     matched.append((inp, lab, itype))
                     break
         # v1.8.11: AI 回了但配不到任何選項 → 印 AI 回應頭兩行協助診斷
@@ -3762,7 +3765,13 @@ class EClassApp:
 
     @staticmethod
     def _texts_match(option_text, answer_text):
-        """選項文字與答案文字是否相符（允許正規化後子字串）"""
+        """v1.8.14：選項文字 vs 答案文字 — 模糊比對（短字面 + 長相似度都過）
+        策略：
+          (1) normalize 後完全相等
+          (2) TF 等價字 — 對↔是↔√、錯↔否↔×
+          (3) 任一方為另一方 substring（短至 2 字也接受）
+          (4) difflib ratio >= 0.7（中長文字寬容打字差異）
+        """
         if not option_text or not answer_text:
             return False
         a = QABank.normalize(option_text)
@@ -3771,11 +3780,24 @@ class EClassApp:
             return False
         if a == b:
             return True
-        # 任一方包含另一方（短答案常被前後標點包圍）
-        if len(b) >= 4 and b in a:
+        # TF 等價組
+        TF_TRUE = {"對", "是", "正確", "true", "T", "Y", "√", "v", "V", "○"}
+        TF_FALSE = {"錯", "否", "錯誤", "不對", "false", "F", "N", "X", "×", "✗"}
+        if (a in TF_TRUE and b in TF_TRUE) or (a in TF_FALSE and b in TF_FALSE):
             return True
-        if len(a) >= 4 and a in b:
+        # substring（門檻降到 2 字）
+        if len(b) >= 2 and b in a:
             return True
+        if len(a) >= 2 and a in b:
+            return True
+        # difflib ratio
+        try:
+            import difflib
+            if len(a) >= 4 and len(b) >= 4:
+                if difflib.SequenceMatcher(None, a, b).ratio() >= 0.7:
+                    return True
+        except Exception:
+            pass
         return False
 
     def _switch_to_question_frame(self):
