@@ -62,7 +62,7 @@ except Exception as _e:
 GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-1.5-flash:generateContent")
 
-VERSION = "1.8.10"
+VERSION = "1.8.11"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -401,6 +401,10 @@ class EClassApp:
                         or (len(line_n) >= 6 and line_n in lab_n)):
                     matched.append((inp, lab, itype))
                     break
+        # v1.8.11: AI 回了但配不到任何選項 → 印 AI 回應頭兩行協助診斷
+        if not matched and text:
+            _preview = " / ".join(text.splitlines()[:2])[:120]
+            self.log(f"⚠ AI 回了但配不到選項：{_preview}")
         return matched
 
     # ── GUI 建構 ──────────────────────────────────────────
@@ -3784,10 +3788,22 @@ class EClassApp:
             n_fallback = 0
 
             # v1.8.9: 選項池直配 — 用該課程所有已知正解建 set
+            # v1.8.11: 加診斷 log，pool 為空 / 課程名不匹配時也告知
             _course_hint = getattr(self, "_current_course_title", "")
             correct_pool = self.qa_bank.find_correct_options(course_hint=_course_hint)
             if correct_pool:
                 self.log(f"🎯 選項池備妥：「{_course_hint[:30]}」共 {len(correct_pool)} 個已知正解選項")
+            else:
+                # 診斷：列出 qa_bank 既有 course 名，方便比對
+                _all_pool = self.qa_bank.find_correct_options(course_hint="")
+                _courses_in_bank = sorted({(v.get("course") or "")[:50]
+                                           for v in self.qa_bank.data.values()
+                                           if v.get("course")})
+                self.log(f"⚠ 選項池空：course_hint=「{_course_hint[:40]}」 "
+                         f"題庫總正解={len(_all_pool)}")
+                if _courses_in_bank:
+                    self.log(f"   題庫含 {len(_courses_in_bank)} 門課："
+                             f"{' | '.join(_courses_in_bank[:3])}{'...' if len(_courses_in_bank)>3 else ''}")
 
             # v1.8.7：debug dump — 第一次出現 empty qtext 時記錄 input HTML
             _dumped = False
@@ -3841,6 +3857,11 @@ class EClassApp:
                     else:
                         self.log(f"📚 題庫命中：{qshow}")
                 else:
+                    # v1.8.11: 診斷 — 為什麼 AI 沒被呼叫
+                    if not qtext:
+                        self.log(f"⚠ AI 跳過：抓不到題目文字（name={name}）→ 走 pool/押題")
+                    elif not self._gemini:
+                        self.log(f"⚠ AI 跳過：Gemini 未啟用或已停用 → 走 pool/押題")
                     # v1.8.8：題庫 miss → 嘗試 Gemini AI 答題
                     if qtext and self._gemini:
                         ai_matched = self._ask_ai(qtext, opts)
@@ -3918,6 +3939,18 @@ class EClassApp:
                                     pass
                             if matched:
                                 pool_matched.append((inp, lab, itype))
+
+                        # v1.8.11: pool 有但全選項都沒中 → 印選項與 pool 樣本診斷
+                        if not pool_matched and qtext:
+                            _opt_show = " | ".join(
+                                [(l[:18] + "..." if len(l) > 18 else l)
+                                 for _i, l, _t in opts if l][:4])
+                            _pool_sample = list(correct_pool)[:3]
+                            _pool_show = " | ".join(
+                                [(p[:18] + "..." if len(p) > 18 else p)
+                                 for p in _pool_sample])
+                            self.log(f"🔎 pool 未中：選項=[{_opt_show}] "
+                                     f"vs pool 樣本=[{_pool_show}]")
 
                         if pool_matched:
                             itype0 = opts[0][2] if opts else "radio"
