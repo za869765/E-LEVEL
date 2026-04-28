@@ -63,7 +63,7 @@ GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.15"
+VERSION = "1.8.16"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -1953,13 +1953,17 @@ class EClassApp:
             except Exception as _e:
                 self.log(f"問卷處理錯誤: {_e}")
 
-            if not exam_done and not survey_done:
-                self.log("【3/3】測驗、問卷皆未能直接進行 → 進入上課累積時數...")
+            # v1.8.16：條件改成「只要測驗沒過就要回上課」
+            # （之前 `not exam_done and not survey_done` → 問卷單獨 done 時就跳過上課，
+            # 但問卷可獨立完成不代表時數夠 → 測驗永遠考不了）
+            if not exam_done:
+                self.log("【3/3】測驗未能直接進行 → 進入上課累積時數...")
                 self._learning_loop(required_minutes=req_min)
                 self.log("時數累積結束，再次嘗試測驗...")
                 self._auto_take_exam()
-                self.log("再次嘗試問卷...")
-                self._auto_fill_player_survey()
+                if not survey_done:
+                    self.log("再次嘗試問卷...")
+                    self._auto_fill_player_survey()
             else:
                 self.log(f"本課程處理結果：測驗={'✓' if exam_done else '×'} "
                          f"問卷={'✓' if survey_done else '×'}")
@@ -2184,7 +2188,19 @@ class EClassApp:
                 return True
         return False
 
+    def _try_jump_to_lesson_sysbar(self):
+        """v1.8.16：點左側「開始上課」回到上課播放器（修「測驗/問卷後沒回上課」）"""
+        return self._try_jump_to_sysbar_link(
+            ["開始上課", "lesson", "play"], "開始上課")
+
     def _learning_loop(self, required_minutes=0):
+        # v1.8.16：進 loop 前先確保在上課頁面（不在的話 _find_chapters 會空轉）
+        try:
+            if self._try_jump_to_lesson_sysbar():
+                self.log("✓ 已切回「開始上課」")
+                self._human_sleep(2.0, 0.5)
+        except Exception:
+            pass
         self.log("開始上課！請專心聽講......")
         check_every = 10   # 每 10 次循環做一次時數確認（內部固定值）
         local_cycle = 0
