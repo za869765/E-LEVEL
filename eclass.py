@@ -62,7 +62,7 @@ except Exception as _e:
 GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-1.5-flash:generateContent")
 
-VERSION = "1.8.8"
+VERSION = "1.8.9"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -107,6 +107,7 @@ class QABank:
         # 同時 save()/find() 可能在另一 thread 執行 → 產生 `dictionary changed size during iteration`
         # 或寫出損毀的 JSON。加 RLock 保護所有讀寫。
         self._lock = threading.RLock()
+        self._option_index = None   # v1.8.9: lazy built by find_correct_options()
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as f:
@@ -171,6 +172,35 @@ class QABank:
                     best = v
             return best
 
+    @staticmethod
+    def _course_match(a, b, threshold=0.6):
+        """v1.8.9：寬鬆課程名比對（包含關係 or difflib 0.6）"""
+        if not a or not b:
+            return False
+        an = re.sub(r'[\s　/／\-]+', '', a)
+        bn = re.sub(r'[\s　/／\-]+', '', b)
+        if an in bn or bn in an:
+            return True
+        try:
+            import difflib
+            return difflib.SequenceMatcher(None, an, bn).ratio() >= threshold
+        except Exception:
+            return False
+
+    def find_correct_options(self, course_hint=""):
+        """v1.8.9：回傳該課程所有已知正解選項的 normalized text set（選項池直配用）"""
+        with self._lock:
+            pool = set()
+            for v in self.data.values():
+                if course_hint and not self._course_match(
+                        v.get("course", ""), course_hint):
+                    continue
+                for ans in v.get("a") or []:
+                    norm = self.normalize(ans)
+                    if norm:
+                        pool.add(norm)
+            return pool
+
     def add(self, question_text, answers, qtype="SC", course="", overwrite=True):
         """新增/更新一題
         v1.8.7 bug #5：加 overwrite 參數（預設 True 保留原行為）。
@@ -189,6 +219,7 @@ class QABank:
                 "a": list(answers) if isinstance(answers, (list, tuple)) else [answers],
                 "course": course or "",
             }
+            self._option_index = None   # v1.8.9: invalidate cache
             self._dirty = True
 
     def add_if_absent(self, question_text, answers, qtype="SC", course=""):
@@ -251,7 +282,7 @@ class EClassApp:
         self._stats = {
             "courses_attempted": 0, "courses_passed": 0, "courses_failed": 0,
             "exam_attempts": 0, "exams_passed": 0,
-            "questions_total": 0, "db_hits": 0, "fallbacks": 0,
+            "questions_total": 0, "db_hits": 0, "option_hits": 0, "fallbacks": 0,
             "ai_hits": 0,       # v1.8.8: Gemini AI 答題命中
             "harvested_questions": 0, "options_eliminated": 0,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -3746,10 +3777,17 @@ class EClassApp:
                 lab = self._get_option_label(inp)
                 groups.setdefault(name, []).append((inp, lab, itype))
 
-            n_total   = len(groups)
-            n_db_hit  = 0
-            n_ai_hit  = 0   # v1.8.8：Gemini AI 命中
+            n_total    = len(groups)
+            n_db_hit   = 0
+            n_opt_hit  = 0  # v1.8.9: 選項池直配命中
+            n_ai_hit   = 0  # v1.8.8：Gemini AI 命中
             n_fallback = 0
+
+            # v1.8.9: 選項池直配 — 用該課程所有已知正解建 set
+            _course_hint = getattr(self, "_current_course_title", "")
+            correct_pool = self.qa_bank.find_correct_options(course_hint=_course_hint)
+            if correct_pool:
+                self.log(f"🎯 選項池備妥：「{_course_hint[:30]}」共 {len(correct_pool)} 個已知正解選項")
 
             # v1.8.7：debug dump — 第一次出現 empty qtext 時記錄 input HTML
             _dumped = False
@@ -3851,6 +3889,71 @@ class EClassApp:
                                     pass
                                 continue   # 跳過 fallback
 
+                    # v1.8.9: 選項池直配（題庫 miss + AI miss 後）
+                    if correct_pool:
+                        pool_matched = []
+                        for inp, lab, itype in opts:
+                            lab_norm = QABank.normalize(lab)
+                            if not lab_norm:
+                                continue
+                            # 三層比對：(1) 完全相等 (2) 互為子字串≥6字 (3) difflib≥0.85
+                            matched = False
+                            if lab_norm in correct_pool:
+                                matched = True
+                            elif len(lab_norm) >= 6:
+                                for p in correct_pool:
+                                    if len(p) >= 6 and (lab_norm in p or p in lab_norm):
+                                        matched = True
+                                        break
+                            if not matched:
+                                try:
+                                    import difflib
+                                    for p in correct_pool:
+                                        if len(p) >= 6 and len(lab_norm) >= 6:
+                                            if difflib.SequenceMatcher(
+                                                    None, lab_norm, p).ratio() >= 0.85:
+                                                matched = True
+                                                break
+                                except Exception:
+                                    pass
+                            if matched:
+                                pool_matched.append((inp, lab, itype))
+
+                        if pool_matched:
+                            itype0 = opts[0][2] if opts else "radio"
+                            clicked_pool = False
+                            if itype0 == "radio":
+                                try:
+                                    self.driver.execute_script(
+                                        "arguments[0].click()", pool_matched[0][0])
+                                    clicked_pool = True
+                                except Exception:
+                                    pass
+                            else:
+                                # MC: 取消所有已勾 → 勾所有命中
+                                for i2, _l2, _t2 in opts:
+                                    try:
+                                        if i2.is_selected():
+                                            self.driver.execute_script(
+                                                "arguments[0].click()", i2)
+                                    except Exception:
+                                        pass
+                                for inp_m, _lm, _tm in pool_matched:
+                                    try:
+                                        self.driver.execute_script(
+                                            "arguments[0].click()", inp_m)
+                                        clicked_pool = True
+                                    except Exception:
+                                        pass
+                            if clicked_pool:
+                                n_opt_hit += 1
+                                mlabs = " | ".join(
+                                    [(l[:25] + "..." if len(l) > 25 else l)
+                                     for _i, l, _t in pool_matched])
+                                qshow_p = qtext[:50] + ("..." if len(qtext) > 50 else "")
+                                self.log(f"🎯 選項池命中：{qshow_p} → {mlabs}")
+                                continue  # 跳過 fallback
+
                     n_fallback += 1
                     self._fallback_answer_group(opts, qtext=qtext)
                     qshow = qtext[:60] + ("..." if len(qtext) > 60 else "")
@@ -3874,10 +3977,11 @@ class EClassApp:
                     else:
                         self.log(f"❓ 抓不到題目文字（name={name}）")
 
-            self.log(f"答題完成（{n_total} 題：題庫 {n_db_hit} / AI {n_ai_hit} / 押題 {n_fallback}）")
+            self.log(f"答題完成（{n_total} 題：題庫 {n_db_hit} / 選項池 {n_opt_hit} / AI {n_ai_hit} / 押題 {n_fallback}）")
             try:
                 self._stats["questions_total"] += n_total
                 self._stats["db_hits"]         += n_db_hit
+                self._stats["option_hits"]     += n_opt_hit
                 self._stats["ai_hits"]         += n_ai_hit
                 self._stats["fallbacks"]       += n_fallback
             except Exception:
@@ -4310,7 +4414,7 @@ class EClassApp:
             self.log(f"  起始：{s.get('started_at','')}")
             self.log(f"  課程：嘗試 {s.get('courses_attempted',0)}、過 {s.get('courses_passed',0)}、未過 {s.get('courses_failed',0)}")
             self.log(f"  測驗：總 attempt {s.get('exam_attempts',0)}、通過 {s.get('exams_passed',0)}")
-            self.log(f"  答題：總 {s.get('questions_total',0)} 題（題庫 {s.get('db_hits',0)} / AI {s.get('ai_hits',0)} / 押題 {s.get('fallbacks',0)}）")
+            self.log(f"  答題：總 {s.get('questions_total',0)} 題（題庫 {s.get('db_hits',0)} / 選項池 {s.get('option_hits',0)} / AI {s.get('ai_hits',0)} / 押題 {s.get('fallbacks',0)}）")
             self.log(f"  學習：harvester 收割 {s.get('harvested_questions',0)} 題")
             self.log(f"  目前題庫總量：{self.qa_bank.count()} 題")
             self.log(f"  未命中（待人工）：{len(self._missed_questions)} 題")
