@@ -62,7 +62,7 @@ except Exception as _e:
 GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-1.5-flash:generateContent")
 
-VERSION = "1.8.9"
+VERSION = "1.8.10"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -4487,7 +4487,15 @@ class AccountDialog(tk.Toplevel):
 
         ttk.Label(self, text="密碼：").grid(row=2, column=0, padx=10, pady=6, sticky="w")
         self.password_var = tk.StringVar(value=data.get("password", ""))
-        ttk.Entry(self, textvariable=self.password_var, show="*", width=24).grid(row=2, column=1, padx=10, pady=6)
+        pw_frame = ttk.Frame(self)
+        pw_frame.grid(row=2, column=1, padx=10, pady=6, sticky="w")
+        self._pw_entry = ttk.Entry(pw_frame, textvariable=self.password_var,
+                                   show="*", width=20)
+        self._pw_entry.pack(side=tk.LEFT)
+        self._pw_visible = False
+        self._pw_btn = ttk.Button(pw_frame, text="👁", width=3,
+                                  command=self._toggle_password)
+        self._pw_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         self.login_type = tk.StringVar(value="elearn")
 
@@ -4497,6 +4505,11 @@ class AccountDialog(tk.Toplevel):
         ttk.Button(bf, text="取消", command=self.destroy).pack(side=tk.LEFT)
 
         self.wait_window()
+
+    def _toggle_password(self):
+        self._pw_visible = not self._pw_visible
+        self._pw_entry.config(show="" if self._pw_visible else "*")
+        self._pw_btn.config(text="🙈" if self._pw_visible else "👁")
 
     def _ok(self):
         acc = self.account_var.get().strip()
