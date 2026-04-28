@@ -60,9 +60,9 @@ except Exception as _e:
 
 # v1.8.8：Gemini AI 答題（用 urllib 直連 REST API，避免 SDK 啟動拖慢）
 GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
-                  "models/gemini-1.5-flash:generateContent")
+                  "models/gemini-flash-latest:generateContent")
 
-VERSION = "1.8.11"
+VERSION = "1.8.12"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -188,18 +188,40 @@ class QABank:
             return False
 
     def find_correct_options(self, course_hint=""):
-        """v1.8.9：回傳該課程所有已知正解選項的 normalized text set（選項池直配用）"""
+        """v1.8.9：回傳該課程所有已知正解選項的 normalized text set（選項池直配用）
+        v1.8.12：跨課汙染處理 — 若 hint 提供，優先收嚴格命中（包含關係或 ratio>=0.85）
+        的課程；只有零命中時才退回寬鬆 0.6。並對短答案另存 short_pool，避免短詞誤配長題。
+        """
+        import difflib
         with self._lock:
-            pool = set()
+            strict_pool, loose_pool = set(), set()
             for v in self.data.values():
-                if course_hint and not self._course_match(
-                        v.get("course", ""), course_hint):
+                course = v.get("course", "") or ""
+                ans_list = v.get("a") or []
+                if not course_hint:
+                    for ans in ans_list:
+                        norm = self.normalize(ans)
+                        if norm:
+                            strict_pool.add(norm)
                     continue
-                for ans in v.get("a") or []:
-                    norm = self.normalize(ans)
-                    if norm:
-                        pool.add(norm)
-            return pool
+                # strict: 包含或 difflib >= 0.85
+                a_n = re.sub(r'[\s　/／\-]+', '', course)
+                b_n = re.sub(r'[\s　/／\-]+', '', course_hint)
+                strict_hit = (a_n and b_n and
+                              (a_n in b_n or b_n in a_n or
+                               difflib.SequenceMatcher(None, a_n, b_n).ratio() >= 0.75))
+                loose_hit = strict_hit or self._course_match(course, course_hint)
+                if strict_hit:
+                    for ans in ans_list:
+                        norm = self.normalize(ans)
+                        if norm:
+                            strict_pool.add(norm)
+                elif loose_hit:
+                    for ans in ans_list:
+                        norm = self.normalize(ans)
+                        if norm:
+                            loose_pool.add(norm)
+            return strict_pool if strict_pool else loose_pool
 
     def add(self, question_text, answers, qtype="SC", course="", overwrite=True):
         """新增/更新一題
@@ -3521,10 +3543,27 @@ class EClassApp:
         return ""
 
     def _cleanup_qtext(self, text):
-        """v1.8.7：移除題型 / 配分 / 題號 / whitespace（題庫 key 用）"""
+        """v1.8.7：移除題型 / 配分 / 題號 / whitespace（題庫 key 用）
+        v1.8.12：強化前綴切除 — reverse DOM walk 常把考試頁 chrome（測驗資訊/題數/作答區/
+        剩下時間）以及「上一題答案殘留」一起吃進來。改用：找出文字中最後出現的「N.」或「N、」
+        題號（後面接空白），從該題號之後當作真題目。
+        """
         if not text:
             return ""
         try:
+            # 1) 切除考試頁 chrome 前綴
+            for marker in ("作答區", "剩下時間", "頁數", "測驗資訊"):
+                idx = text.rfind(marker)
+                if idx >= 0:
+                    # 取 marker 之後
+                    text = text[idx + len(marker):]
+            # 2) 找最後一個「N. 」或「N、」題號 — 切到題號之後
+            #    匹配如 "1. 題目" / "10、題目" / " 6. 身心障礙..."
+            #    限制 N <= 3 位數，避免吃到題目中的年份「2008.」
+            matches = list(re.finditer(r'(?:^|\s)(\d{1,3})\s*[.\．、]\s+', text))
+            if matches:
+                last = matches[-1]
+                text = text[last.end():]
             text = re.sub(r'(單選題?|多選題?|複選題?|是非題?)', '', text)
             text = re.sub(r'配分\s*[：:]?\s*\[?[\d\.]+\]?\s*分?', '', text)
             text = re.sub(r'\[\s*\d+(?:\.\d+)?\s*\]\s*分?', '', text)
