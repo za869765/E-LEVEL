@@ -63,7 +63,7 @@ GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.16"
+VERSION = "1.8.17"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2134,7 +2134,8 @@ class EClassApp:
             pass
 
     def _dismiss_player_popup(self):
-        """關閉播放器內每30分鐘的驗證彈窗（未按確定會被登出）"""
+        """關閉播放器內每30分鐘的驗證彈窗（未按確定會被登出）
+           v1.8.17：跨 frame 偵測 + 橘色按鈕特徵 fallback"""
         # 1. JS alert（最高優先）
         try:
             alert = self.driver.switch_to.alert
@@ -2143,49 +2144,114 @@ class EClassApp:
             return True
         except Exception:
             pass
-        # 2. 頁面內驗證彈窗（按確定/繼續/繼續上課）
-        # bug #42:
-        #   原本用 contains(normalize-space(),'X') + 短 token "OK"/"繼續"/"確定"，
-        #   會誤觸 "Book"、"取消繼續"、"離開" 等反向按鈕。
-        #   改為：
-        #     (1) 長 token 用 contains
-        #     (2) 短 token 改 normalize-space()='X' 完全相等
-        #     (3) 加排除清單避免 "取消"/"離開"/"關閉"
-        long_phrases = ["繼續上課", "繼續學習", "仍在上課", "確認在線",
-                        "繼續觀看"]
+
+        long_phrases = ["繼續上課", "繼續學習", "仍在上課", "確認在線", "繼續觀看",
+                        "我還在學習", "我還在", "繼續上課程"]
         exact_words  = ["繼續", "確認", "確定", "我在", "OK"]
         bad_words    = ["取消", "離開", "關閉", "回上一頁", "結束"]
         elem_filter = ("(self::button or self::a or self::input[@type='button'] "
                        "or self::input[@type='submit'])")
 
-        def _try_click(xpath, label):
+        def _try_click_in_current(xpath, label):
             try:
                 btns = self.driver.find_elements(By.XPATH, xpath)
                 for btn in btns:
-                    if not btn.is_displayed():
+                    try:
+                        if not btn.is_displayed():
+                            continue
+                        text_norm = (btn.text or btn.get_attribute("value") or "").strip()
+                        if any(bw in text_norm for bw in bad_words):
+                            continue
+                        self.driver.execute_script("arguments[0].click()", btn)
+                        self.log(f"已回應驗證彈窗：{label} (按鈕文字：{text_norm[:20]})")
+                        return True
+                    except Exception:
                         continue
-                    text_norm = (btn.text or btn.get_attribute("value") or "").strip()
-                    if any(bw in text_norm for bw in bad_words):
-                        continue
-                    self.driver.execute_script("arguments[0].click()", btn)
-                    self.log(f"已回應驗證彈窗：{label} (按鈕文字：{text_norm[:20]})")
-                    return True
             except Exception:
                 pass
             return False
 
-        for text in long_phrases:
-            if _try_click(
-                f"//*[contains(normalize-space(),'{text}') and {elem_filter}]",
-                text,
-            ):
+        def _try_orange_button():
+            """v1.8.17：抓橘色／黃色背景的可點按鈕（30 分鐘確認鈕通常是橘色）"""
+            xp = ("//*[" + elem_filter + " and ("
+                  "contains(@style,'orange') or contains(@style,'#F90') "
+                  "or contains(@style,'#f90') or contains(@style,'#FF9') "
+                  "or contains(@style,'#ff9') or contains(@style,'rgb(255') "
+                  "or contains(@class,'orange') or contains(@class,'btn-warning') "
+                  "or contains(@class,'btn_orange') or contains(@class,'btnContinue'))]")
+            try:
+                btns = self.driver.find_elements(By.XPATH, xp)
+                for btn in btns:
+                    try:
+                        if not btn.is_displayed():
+                            continue
+                        text_norm = (btn.text or btn.get_attribute("value") or "").strip()
+                        if any(bw in text_norm for bw in bad_words):
+                            continue
+                        # 額外驗證：橘色按鈕通常文字短且包含「繼續/確認/我」
+                        if not text_norm or len(text_norm) > 30:
+                            continue
+                        if any(kw in text_norm for kw in ("繼續", "確認", "確定", "我", "OK", "I")):
+                            self.driver.execute_script("arguments[0].click()", btn)
+                            self.log(f"已回應驗證彈窗(橘色按鈕): {text_norm[:20]}")
+                            return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return False
+
+        def _scan_one_context():
+            """在當前 frame context 中嘗試所有方法"""
+            for text in long_phrases:
+                if _try_click_in_current(
+                    f"//*[contains(normalize-space(),'{text}') and {elem_filter}]", text):
+                    return True
+            for text in exact_words:
+                if _try_click_in_current(
+                    f"//*[normalize-space()='{text}' and {elem_filter}]", text):
+                    return True
+            if _try_orange_button():
                 return True
-        for text in exact_words:
-            if _try_click(
-                f"//*[normalize-space()='{text}' and {elem_filter}]",
-                text,
-            ):
-                return True
+            return False
+
+        # 先在 default content 找
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        if _scan_one_context():
+            return True
+
+        # 跨 frame 找
+        try:
+            for frame in self._all_frames():
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(frame)
+                    if _scan_one_context():
+                        return True
+                    # 子 frame
+                    try:
+                        for inner in self._all_frames():
+                            try:
+                                self.driver.switch_to.frame(inner)
+                                if _scan_one_context():
+                                    return True
+                                self.driver.switch_to.parent_frame()
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+                finally:
+                    try: self.driver.switch_to.default_content()
+                    except Exception: pass
+        except Exception:
+            pass
+        try: self.driver.switch_to.default_content()
+        except Exception: pass
         return False
 
     def _try_jump_to_lesson_sysbar(self):
@@ -2292,24 +2358,48 @@ class EClassApp:
         """衛生福利e學園 用 <frame> 而非 <iframe>，章節在 s_catalog frame
         中華 e等公務園 等其他平台則直接在 main page 或 iframe 內
         """
+        # v1.8.17 擴充 selectors（衛生福利e學園 + e等公務園 + 中華 e 等公務園 通吃）
         selectors = [
             "input[type='radio']",
             "a[onclick*='goPage']",
             "a[onclick*='play']",
             "a[onclick*='changeContent']",
             "a[onclick*='selectChapter']",
+            "a[onclick*='openLesson']",
+            "a[onclick*='SCO']",
             "[onclick*='lesson']",
             "[onclick*='unit']",
+            "[onclick*='Chapter']",
+            "[onclick*='Lesson']",
+            "[onclick*='Unit']",
+            "[onclick*='showSCO']",
+            "[onclick*='openPDF']",
+            "[onclick*='LoadCourse']",
+            "[onclick*='loadContent']",
+            "[onclick*='ChangeNode']",
+            "span[onclick]",
+            "li[onclick]",
+            "div[onclick][role='button']",
             ".syllabus_node",
             ".course_tree li a",
             ".chapter_item",
             ".lesson_menu li",
             ".tree_node input",
+            ".tree_node a",
             "#contentList li a",
             "ul.chapters li a",
+            "ul.chapter_list li",
             ".sidebar a[onclick]",
             ".course_menu a",
+            ".lesson_unit a",
+            ".course_node",
+            "[role='treeitem']",
+            "[data-sco-id]",
+            "[data-lesson-id]",
             "label[for*='lesson'], label[for*='unit']",
+            # 兜底：任何 cursor:pointer + 看起來像章節文字的元素
+            "li[style*='cursor']",
+            "span[style*='cursor:pointer']",
         ]
 
         # 主頁面找一次
