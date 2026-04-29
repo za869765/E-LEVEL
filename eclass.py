@@ -63,7 +63,7 @@ GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.17"
+VERSION = "1.8.18"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -516,7 +516,8 @@ class EClassApp:
                                     style="Big.TButton", command=self._on_login)
         self.start_btn = ttk.Button(self._btn_frame, text="開始上課",
                                     style="Big.TButton", command=self._on_start)
-        self.stop_btn  = ttk.Button(self._btn_frame, text="停止",
+        # v1.8.18 「停止」改為「停止存檔退出」 — 仿 hiv_code 行為
+        self.stop_btn  = ttk.Button(self._btn_frame, text="■ 停止存檔退出",
                                     style="Big.TButton", command=self._on_stop)
         self._set_btn_layout("pre_login")  # 初始狀態
 
@@ -1422,9 +1423,10 @@ class EClassApp:
         threading.Thread(target=self._auto_learn_main, daemon=True).start()
 
     def _on_stop(self):
+        """v1.8.18：停止 = 收尾統計 + 存 log + 存題庫 + 關瀏覽器 + 關程式
+           （仿 hiv_code「停止存檔退出」行為）"""
         self.running = False
-        self._set_status("已停止")
-        # v1.8.7：印統計
+        self._set_status("已停止 → 存檔中…")
         try:
             self._print_session_stats()
         except Exception:
@@ -1437,11 +1439,21 @@ class EClassApp:
             self._save_missed_questions()
         except Exception:
             pass
-        # 判斷目前是否已登入，決定回到哪個狀態
-        if self._is_logged_in():
-            self._set_btn_layout("ready")
-        else:
-            self._set_btn_layout("pre_login")
+        try:
+            self._save_config()
+        except Exception:
+            pass
+        # v1.8.18：自動存 log（無需使用者手動按）
+        try:
+            self._save_log()
+        except Exception:
+            pass
+        # 走完整 _on_close 關瀏覽器 + 關程式
+        try:
+            self._on_close()
+        except Exception:
+            try: self.root.destroy()
+            except Exception: pass
 
     def _auto_learn_main(self):
         # 重置「已嘗試課程」清單（每次按開始上課都從頭算）
@@ -2300,6 +2312,10 @@ class EClassApp:
                         time.sleep(0.5)
                     except (StaleElementReferenceException, WebDriverException):
                         break
+            elif self._try_pathtree_advance():
+                # v1.8.18：衛生福利e學園的 pathtree.nextStep(1) 推進
+                no_chapter_count = 0
+                time.sleep(2)
             else:
                 no_chapter_count += 1
                 if no_chapter_count <= 3:
@@ -2307,13 +2323,11 @@ class EClassApp:
                     time.sleep(10)
                     continue
                 elif no_chapter_count == 4:
-                    # 第 4 次找不到 → dump player 給我除錯
                     self.log("⚠ 連續 3 次找不到章節，dump player HTML...")
                     self._dump_player_debug()
                     self.log("停留在課程頁面（等待時數累積）...")
                     time.sleep(60)
                 else:
-                    # 找不到章節 → 停留在課程頁面等時數累積
                     self.log("停留在課程頁面（等待時數累積）...")
                     time.sleep(60)
 
@@ -2353,6 +2367,42 @@ class EClassApp:
         except Exception:
             pass
         return frames
+
+    def _try_pathtree_advance(self):
+        """v1.8.18：衛生福利e學園 章節由 JS pathtree 動態管理；
+        靜態 selector 抓不到，改用 pathtree.nextStep(1) 推進一個節點。
+        回 True 代表有成功呼叫"""
+        try:
+            for frame in self._all_frames():
+                try:
+                    name = frame.get_attribute("name") or ""
+                    fid  = frame.get_attribute("id") or ""
+                    if name not in ("s_catalog",) and fid not in ("s_catalog",):
+                        continue
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(frame)
+                    has = self.driver.execute_script(
+                        "return typeof pathtree !== 'undefined' && typeof pathtree.nextStep === 'function';")
+                    if not has:
+                        continue
+                    # 先展開全部章節
+                    try:
+                        self.driver.execute_script("pathtree.expandingAll && pathtree.expandingAll();")
+                    except Exception:
+                        pass
+                    # 推進到下一節點
+                    self.driver.execute_script("pathtree.nextStep(1);")
+                    self.driver.switch_to.default_content()
+                    self.log("→ pathtree.nextStep(1) 已推進章節")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        finally:
+            try: self.driver.switch_to.default_content()
+            except Exception: pass
+        return False
 
     def _find_chapters(self):
         """衛生福利e學園 用 <frame> 而非 <iframe>，章節在 s_catalog frame
@@ -4665,6 +4715,7 @@ class EClassApp:
                 pass
 
     def _on_close(self):
+        """v1.8.18：關閉視窗時也自動存 log（仿 hiv_code）"""
         self.running = False
         try:
             self._print_session_stats()
@@ -4680,6 +4731,11 @@ class EClassApp:
             pass
         try:
             self._save_missed_questions()
+        except Exception:
+            pass
+        # v1.8.18：自動存 log
+        try:
+            self._save_log()
         except Exception:
             pass
         self.root.destroy()
