@@ -62,8 +62,12 @@ except Exception as _e:
 GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
+# v1.8.20: Gemini Flash-Lite 預估費用（USD per token）— UI 顯示用，免費版實際 $0
+GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
+GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
+GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.19"
+VERSION = "1.8.20"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -308,6 +312,10 @@ class EClassApp:
             "questions_total": 0, "db_hits": 0, "option_hits": 0, "fallbacks": 0,
             "ai_hits": 0,       # v1.8.8: Gemini AI 答題命中
             "harvested_questions": 0, "options_eliminated": 0,
+            # v1.8.20: AI Token 用量追蹤（session 內累計，重啟歸零）
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "ai_calls_total": 0,
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         # v1.8.0：prefetch 狀態
@@ -379,6 +387,15 @@ class EClassApp:
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
+                # v1.8.20: 從 usageMetadata 抓 token 用量並更新 UI
+                usage = data.get("usageMetadata") or {}
+                self._stats["prompt_tokens"]     += int(usage.get("promptTokenCount") or 0)
+                self._stats["completion_tokens"] += int(usage.get("candidatesTokenCount") or 0)
+                self._stats["ai_calls_total"]    += 1
+                try:
+                    self._update_ai_stats()
+                except Exception:
+                    pass
                 cands = data.get("candidates") or []
                 if not cands:
                     return "", 200
@@ -520,6 +537,27 @@ class EClassApp:
         self.stop_btn  = ttk.Button(self._btn_frame, text="■ 停止存檔退出",
                                     style="Big.TButton", command=self._on_stop)
         self._set_btn_layout("pre_login")  # 初始狀態
+
+        # ── AI Token 用量量表（v1.8.20） ──
+        ai_frame = ttk.LabelFrame(main, text="🤖 AI Token 使用量", padding=6)
+        ai_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self.ai_stats_var = tk.StringVar(value="呼叫 0 次　｜　輸入 0　｜　輸出 0 tokens")
+        ttk.Label(ai_frame, textvariable=self.ai_stats_var,
+                  font=("Microsoft JhengHei", 9)).pack(anchor="w")
+
+        self.ai_cost_var = tk.StringVar(value="預估費用：$0.0000 USD（付費版價格，免費版實際 $0）")
+        ttk.Label(ai_frame, textvariable=self.ai_cost_var,
+                  foreground="#388E3C",
+                  font=("Microsoft JhengHei", 9, "bold")).pack(anchor="w")
+
+        ai_bar_row = ttk.Frame(ai_frame)
+        ai_bar_row.pack(fill=tk.X, pady=(4, 0))
+        self.ai_progress = ttk.Progressbar(ai_bar_row, maximum=GEMINI_FREE_RPD, length=300)
+        self.ai_progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.ai_quota_var = tk.StringVar(value=f"0 / {GEMINI_FREE_RPD} 次")
+        ttk.Label(ai_bar_row, textvariable=self.ai_quota_var,
+                  foreground="gray", width=14, anchor="e").pack(side=tk.LEFT, padx=(6, 0))
 
         # ── 狀態 ──
         self.status_var = tk.StringVar(value="就緒")
@@ -697,6 +735,31 @@ class EClassApp:
 
     def _set_status(self, text):
         self.status_var.set(text)
+
+    # v1.8.20: AI Token 用量顯示（worker thread 呼叫，透過 after_idle 切回主執行緒）
+    def _update_ai_stats(self):
+        in_t  = self._stats.get("prompt_tokens", 0)
+        out_t = self._stats.get("completion_tokens", 0)
+        calls = self._stats.get("ai_calls_total", 0)
+        cost  = (in_t * GEMINI_PRICE_IN) + (out_t * GEMINI_PRICE_OUT)
+
+        def _do():
+            try:
+                self.ai_stats_var.set(
+                    f"呼叫 {calls:,} 次　｜　輸入 {in_t:,}　｜　輸出 {out_t:,} tokens"
+                )
+                self.ai_cost_var.set(
+                    f"預估費用：${cost:.4f} USD（付費版價格，免費版實際 $0）"
+                )
+                self.ai_progress["value"] = min(calls, GEMINI_FREE_RPD)
+                self.ai_quota_var.set(f"{calls} / {GEMINI_FREE_RPD} 次")
+            except Exception:
+                pass
+
+        try:
+            self.root.after_idle(_do)
+        except Exception:
+            _do()
 
     def _clear_log(self):
         self.log_area.delete("1.0", tk.END)
