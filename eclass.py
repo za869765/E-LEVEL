@@ -63,7 +63,7 @@ GEMINI_API_URL = ("https://generativelanguage.googleapis.com/v1beta/"
                   "models/gemini-flash-lite-latest:generateContent")
 GEMINI_MIN_INTERVAL = 4.5   # v1.8.13: free tier 15 RPM → 每次呼叫至少間隔 4 秒
 
-VERSION = "1.8.18"
+VERSION = "1.8.19"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2147,7 +2147,8 @@ class EClassApp:
 
     def _dismiss_player_popup(self):
         """關閉播放器內每30分鐘的驗證彈窗（未按確定會被登出）
-           v1.8.17：跨 frame 偵測 + 橘色按鈕特徵 fallback"""
+           v1.8.17：跨 frame 偵測 + 橘色按鈕特徵 fallback
+           v1.8.19：擴充元素 filter（含 div/span/li 帶 onclick/role），新增 JS-based 最終 fallback"""
         # 1. JS alert（最高優先）
         try:
             alert = self.driver.switch_to.alert
@@ -2161,8 +2162,13 @@ class EClassApp:
                         "我還在學習", "我還在", "繼續上課程"]
         exact_words  = ["繼續", "確認", "確定", "我在", "OK"]
         bad_words    = ["取消", "離開", "關閉", "回上一頁", "結束"]
+        # v1.8.19：擴充 — 連 div/span/li/td 帶 onclick/role/class=btn 也算可點
         elem_filter = ("(self::button or self::a or self::input[@type='button'] "
-                       "or self::input[@type='submit'])")
+                       "or self::input[@type='submit'] "
+                       "or ((self::div or self::span or self::li or self::td or self::p) "
+                       "and (@onclick or @role='button' or contains(@class,'btn') "
+                       "or contains(@class,'button') or contains(@class,'click')))"
+                       ")")
 
         def _try_click_in_current(xpath, label):
             try:
@@ -2255,6 +2261,90 @@ class EClassApp:
                                 continue
                     except Exception:
                         pass
+                except Exception:
+                    continue
+                finally:
+                    try: self.driver.switch_to.default_content()
+                    except Exception: pass
+        except Exception:
+            pass
+
+        # v1.8.19：最終 JS fallback — 暴力掃描所有 frame 內可見的「繼續/確認」文字節點
+        # 從文字節點往上找最近的可點祖先（onclick/role/btn/a/button），點下去
+        js_fallback = r"""
+        (function() {
+          var keywords = ['繼續上課', '繼續學習', '繼續上課程', '仍在上課',
+                          '我還在學習', '確認在線', '繼續觀看', '繼續'];
+          var bad = ['取消', '離開', '結束', '關閉', '回上一頁'];
+          function isVisible(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            var r = el.getBoundingClientRect();
+            if (r.width < 1 || r.height < 1) return false;
+            var st = window.getComputedStyle(el);
+            return st && st.visibility !== 'hidden' && st.display !== 'none' && st.opacity !== '0';
+          }
+          function findClickableAncestor(el) {
+            var cur = el, depth = 0;
+            while (cur && depth < 8) {
+              var tag = (cur.tagName || '').toLowerCase();
+              if (tag === 'button' || tag === 'a') return cur;
+              if (cur.onclick || (cur.getAttribute && (cur.getAttribute('onclick') || cur.getAttribute('role') === 'button'))) return cur;
+              var cls = (cur.className && cur.className.toString && cur.className.toString()) || '';
+              if (/\b(btn|button|click)\b/i.test(cls)) return cur;
+              cur = cur.parentElement; depth++;
+            }
+            return null;
+          }
+          var all = document.body ? document.body.querySelectorAll('*') : [];
+          for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            if (el.children && el.children.length > 0) continue;  // 只看葉子節點
+            var t = (el.innerText || el.textContent || '').replace(/\s+/g, '');
+            if (!t || t.length > 30) continue;
+            var matched = null;
+            for (var k = 0; k < keywords.length; k++) {
+              if (t.indexOf(keywords[k]) >= 0) { matched = keywords[k]; break; }
+            }
+            if (!matched) continue;
+            if (bad.some(function(b) { return t.indexOf(b) >= 0; })) continue;
+            if (!isVisible(el)) continue;
+            var target = findClickableAncestor(el) || el;
+            try {
+              target.click();
+              return matched + '|' + (target.tagName || '?') + '|' + (target.className || '');
+            } catch(e) {}
+          }
+          return null;
+        })();
+        """
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            res = self.driver.execute_script(js_fallback)
+            if res:
+                self.log(f"已回應驗證彈窗(JS fallback): {res[:80]}")
+                return True
+            # 跨 frame JS 掃描
+            for frame in self._all_frames():
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(frame)
+                    res = self.driver.execute_script(js_fallback)
+                    if res:
+                        self.log(f"已回應驗證彈窗(JS fallback,frame): {res[:80]}")
+                        return True
+                    for inner in self._all_frames():
+                        try:
+                            self.driver.switch_to.frame(inner)
+                            res = self.driver.execute_script(js_fallback)
+                            if res:
+                                self.log(f"已回應驗證彈窗(JS fallback,inner): {res[:80]}")
+                                return True
+                            self.driver.switch_to.parent_frame()
+                        except Exception:
+                            continue
                 except Exception:
                     continue
                 finally:
