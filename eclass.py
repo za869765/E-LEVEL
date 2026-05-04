@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.20"
+VERSION = "1.8.21"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2304,31 +2304,56 @@ class EClassApp:
         if _scan_one_context():
             return True
 
-        # 跨 frame 找
+        # v1.8.20：優先掃 s_dialog 這種「對話框 iframe」（hrd.gov.tw e 學習用）
+        priority_frame_names = ["s_dialog", "co_dialog", "dialog", "popup", "confirm"]
         try:
-            for frame in self._all_frames():
+            self.driver.switch_to.default_content()
+            all_iframes = (self.driver.find_elements(By.TAG_NAME, "iframe") +
+                           self.driver.find_elements(By.TAG_NAME, "frame"))
+            for fr in all_iframes:
                 try:
-                    self.driver.switch_to.default_content()
-                    self.driver.switch_to.frame(frame)
-                    if _scan_one_context():
-                        return True
-                    # 子 frame
-                    try:
-                        for inner in self._all_frames():
-                            try:
-                                self.driver.switch_to.frame(inner)
-                                if _scan_one_context():
-                                    return True
-                                self.driver.switch_to.parent_frame()
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
+                    name = (fr.get_attribute("name") or "").lower()
+                    src  = (fr.get_attribute("src")  or "").lower()
+                    if any(p in name or p in src for p in priority_frame_names):
+                        self.driver.switch_to.default_content()
+                        self.driver.switch_to.frame(fr)
+                        self.log(f"優先掃對話框 frame: name={name} src={src[:40]}")
+                        if _scan_one_context():
+                            return True
                 except Exception:
                     continue
+            self.driver.switch_to.default_content()
+        except Exception:
+            try: self.driver.switch_to.default_content()
+            except Exception: pass
+
+        # v1.8.20：遞迴掃所有 frame（不限深度）
+        def _recursive_scan(depth=0, max_depth=4):
+            if depth > max_depth:
+                return False
+            if _scan_one_context():
+                return True
+            try:
+                inners = self._all_frames()
+            except Exception:
+                return False
+            for inner in inners:
+                try:
+                    self.driver.switch_to.frame(inner)
+                except Exception:
+                    continue
+                try:
+                    if _recursive_scan(depth + 1, max_depth):
+                        return True
                 finally:
-                    try: self.driver.switch_to.default_content()
+                    try: self.driver.switch_to.parent_frame()
                     except Exception: pass
+            return False
+
+        try:
+            self.driver.switch_to.default_content()
+            if _recursive_scan():
+                return True
         except Exception:
             pass
 
@@ -2438,14 +2463,25 @@ class EClassApp:
         no_chapter_count = 0
         start_time = time.time()
 
+        # v1.8.20：第一次進場立刻檢查能否測驗（避免漏掉時數已達標）；
+        # 之後改為每 30 分鐘才再確認一次（避免每 cycle 都跳測驗頁）
+        EXAM_CHECK_INTERVAL = 30 * 60  # 秒
+        if self._can_take_exam_now():
+            self.log("⚡ 進場即偵測到「進行測驗」可點 — 時數已達標，跳過播放階段")
+            return
+        last_exam_check = time.time()
+
         while self.running:
             # ── 每次循環優先處理驗證彈窗（30分鐘一次，不處理會被登出）──
             self._dismiss_player_popup()
 
-            # ★ 新規則：只要可以「進行測驗」就代表時數已達標 → 直接結束播放階段
-            if self._can_take_exam_now():
-                self.log("⚡ 偵測到「進行測驗」按鈕可點 — 時數已達標，跳過播放階段")
-                return
+            # v1.8.20：每 30 分鐘才檢查一次測驗按鈕（不再每 cycle）
+            if time.time() - last_exam_check >= EXAM_CHECK_INTERVAL:
+                last_exam_check = time.time()
+                if self._can_take_exam_now():
+                    elapsed_min = (time.time() - start_time) / 60
+                    self.log(f"⚡ 上課 {elapsed_min:.0f} 分後偵測到「進行測驗」可點 — 跳過播放階段")
+                    return
 
             # ── 時數門檻：已達 50% 即退出，進行測驗/問卷 ──
             if required_minutes > 0:
@@ -2849,6 +2885,78 @@ class EClassApp:
                 self.driver.switch_to.default_content()
             except Exception:
                 pass
+
+    def _exam_already_passed(self):
+        """v1.8.20：偵測測驗已通過（避免重做）。
+        指標：頁面跨 frame 含「已通過/恭喜通過/通過測驗/測驗已通過/合格/查看測驗結果」之一，
+              且 NOT 含「未通過/不及格/重新測驗/再次測驗/尚未通過」（避免誤判 fail 頁面）。
+        """
+        PASS_KEYS = ("恭喜通過", "已通過", "通過測驗", "測驗已通過",
+                     "測驗合格", "查看測驗結果", "查看成績")
+        FAIL_KEYS = ("未通過", "不及格", "未達及格", "重新測驗",
+                     "再次測驗", "尚未通過")
+
+        def _check_in_current():
+            # 先排除 fail keys（fail 頁面也常出現「通過」字樣 → 必須先擋）
+            for fk in FAIL_KEYS:
+                try:
+                    els = self.driver.find_elements(
+                        By.XPATH, f"//*[contains(normalize-space(.),'{fk}')]")
+                    for el in els:
+                        try:
+                            if el.is_displayed():
+                                return None  # 明確未通過 → 不算 pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # 再找 pass keys
+            for pk in PASS_KEYS:
+                try:
+                    els = self.driver.find_elements(
+                        By.XPATH, f"//*[contains(normalize-space(.),'{pk}')]")
+                    for el in els:
+                        try:
+                            if el.is_displayed():
+                                return pk
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            return False
+
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        r = _check_in_current()
+        if r is None: return False
+        if r: return True
+
+        try:
+            for fr in self._all_frames():
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(fr)
+                    r = _check_in_current()
+                    if r is None: return False
+                    if r: return True
+                    for inner in self._all_frames():
+                        try:
+                            self.driver.switch_to.frame(inner)
+                            r = _check_in_current()
+                            if r is None: return False
+                            if r: return True
+                            self.driver.switch_to.parent_frame()
+                        except Exception:
+                            try: self.driver.switch_to.parent_frame()
+                            except Exception: pass
+                except Exception:
+                    pass
+        finally:
+            try: self.driver.switch_to.default_content()
+            except Exception: pass
+        return False
 
     def _survey_already_done(self):
         """v1.8.7：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
@@ -3730,6 +3838,12 @@ class EClassApp:
                 if not self._try_jump_to_exam_sysbar():
                     self.log("跳測驗頁失敗，放棄自動測驗")
                     return
+
+            # v1.8.20：跳到測驗頁後先確認是否已通過 → 已通過直接視為達成不再做
+            if self._exam_already_passed():
+                self.log("✓ 此課程測驗已通過，跳過不重做")
+                self._stats["courses_passed"] += 1
+                return
 
             self._stats["courses_attempted"] += 1
             # 重置本門課的 cycling 狀態（新一門課，選項組合不一樣）
