@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.21"
+VERSION = "1.8.22"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2444,6 +2444,54 @@ class EClassApp:
         except Exception: pass
         return False
 
+    def _idle_dialog_visible(self):
+        """v1.8.22：偵測是否仍有「閱讀閒置提醒」對話框（已被 _dismiss_player_popup 嘗試後仍在）
+        辨識特徵：頁面或任一 frame 內可見文字含關鍵字。
+        """
+        js = r"""
+        (function() {
+          var KEYS = ['閱讀閒置提醒', '閱讀閒置', '秒後自動登出', '請點選'];
+          function bodyText(){
+            try { return (document.body && document.body.innerText) || ''; } catch(e){ return ''; }
+          }
+          var t = bodyText();
+          for(var i=0; i<KEYS.length; i++){
+            if(t.indexOf(KEYS[i]) >= 0) return KEYS[i];
+          }
+          return null;
+        })();
+        """
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            return False
+        try:
+            if self.driver.execute_script(js):
+                return True
+            for frame in self._all_frames():
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(frame)
+                    if self.driver.execute_script(js):
+                        return True
+                    for inner in self._all_frames():
+                        try:
+                            self.driver.switch_to.frame(inner)
+                            if self.driver.execute_script(js):
+                                return True
+                            self.driver.switch_to.parent_frame()
+                        except Exception:
+                            try: self.driver.switch_to.parent_frame()
+                            except Exception: pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            try: self.driver.switch_to.default_content()
+            except Exception: pass
+        return False
+
     def _try_jump_to_lesson_sysbar(self):
         """v1.8.16：點左側「開始上課」回到上課播放器（修「測驗/問卷後沒回上課」）"""
         return self._try_jump_to_sysbar_link(
@@ -2462,6 +2510,9 @@ class EClassApp:
         local_cycle = 0
         no_chapter_count = 0
         start_time = time.time()
+        # v1.8.22：「閱讀閒置提醒」對話框首次偵測時間戳
+        idle_dlg_first_seen = None
+        IDLE_DLG_TIMEOUT = 270  # 秒；站方倒數 297 秒，留 27 秒緩衝主動跳考避險
 
         # v1.8.20：第一次進場立刻檢查能否測驗（避免漏掉時數已達標）；
         # 之後改為每 30 分鐘才再確認一次（避免每 cycle 都跳測驗頁）
@@ -2474,6 +2525,32 @@ class EClassApp:
         while self.running:
             # ── 每次循環優先處理驗證彈窗（30分鐘一次，不處理會被登出）──
             self._dismiss_player_popup()
+
+            # v1.8.22：URL 變化監控 — 站方可能因 idle 自動把頁面轉到測驗頁，
+            # 偵測到後立即退出 learning_loop，外層會接 _auto_take_exam()
+            try:
+                cur_url = (self.driver.current_url or "")
+            except Exception:
+                cur_url = ""
+            if "/learn/exam_" in cur_url or "/exam/" in cur_url:
+                self.log(f"⚡ URL 已變到測驗頁（{cur_url[:60]}）→ 退出 learning_loop")
+                return
+
+            # v1.8.22：偵測「閱讀閒置提醒」對話框（_dismiss_player_popup 嘗試後仍在）
+            if self._idle_dialog_visible():
+                if idle_dlg_first_seen is None:
+                    idle_dlg_first_seen = time.time()
+                    self.log("⚠ 偵測到「閱讀閒置提醒」對話框，找不到「確定」按鈕；270 秒後將主動跳測驗頁")
+                elapsed_idle = time.time() - idle_dlg_first_seen
+                if elapsed_idle >= IDLE_DLG_TIMEOUT:
+                    self.log(f"⏰ 閒置對話框已持續 {elapsed_idle:.0f}s 仍無法關閉 → 主動跳測驗頁避險")
+                    if self._try_jump_to_exam_sysbar():
+                        self.log("✓ 主動跳測驗頁成功 → 退出 learning_loop")
+                        return
+                    self.log("⚠ 主動跳測驗失敗，重置倒數再試一輪")
+                    idle_dlg_first_seen = None
+            else:
+                idle_dlg_first_seen = None
 
             # v1.8.20：每 30 分鐘才檢查一次測驗按鈕（不再每 cycle）
             if time.time() - last_exam_check >= EXAM_CHECK_INTERVAL:
@@ -2512,9 +2589,14 @@ class EClassApp:
                     time.sleep(10)
                     continue
                 elif no_chapter_count == 4:
+                    # v1.8.22：章節耗盡 → dump 後立刻嘗試跳測驗（不必空轉等 idle dialog）
                     self.log("⚠ 連續 3 次找不到章節，dump player HTML...")
                     self._dump_player_debug()
-                    self.log("停留在課程頁面（等待時數累積）...")
+                    self.log("章節耗盡，主動嘗試跳測驗頁...")
+                    if self._try_jump_to_exam_sysbar():
+                        self.log("⚡ 章節耗盡跳測驗成功 → 退出 learning_loop")
+                        return
+                    self.log("跳測驗失敗，停留在課程頁面（等待時數累積）...")
                     time.sleep(60)
                 else:
                     self.log("停留在課程頁面（等待時數累積）...")
