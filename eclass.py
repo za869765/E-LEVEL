@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.31"
+VERSION = "1.8.32"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2016,8 +2016,7 @@ class EClassApp:
                 time.sleep(3)
                 self.log("已點擊「上課去」")
                 if len(self.driver.window_handles) > 1:
-                    self.driver.switch_to.window(self.driver.window_handles[-1])
-                    self.log("切換到課程播放器視窗")
+                    self._switch_to_course_window()
                 self._dismiss_page_popup()
             except TimeoutException:
                 self.log("找不到「上課去」按鈕，嘗試直接進行測驗/問卷...")
@@ -2821,6 +2820,44 @@ class EClassApp:
         except Exception:
             pass
         return frames
+
+    def _switch_to_course_window(self):
+        """v1.8.32:切換到課程 domain 的 window,跳過 Edge 內建頁(edge://nurturing 等)。
+        從新到舊試 handle,找到 elearn.hrd.gov.tw 就切過去;
+        沒找到 → 嘗試關掉 edge:// / chrome:// 非課程視窗,留主視窗。
+        """
+        target_domain = "elearn.hrd.gov.tw"
+        handles = list(self.driver.window_handles)
+        for h in reversed(handles):
+            try:
+                self.driver.switch_to.window(h)
+                cur_url = (self.driver.current_url or "").lower()
+                if target_domain in cur_url:
+                    self.log(f"切換到課程播放器視窗 (URL: {cur_url[:60]})")
+                    return True
+            except Exception:
+                continue
+        # 沒找到課程 domain — 關閉非課程內建頁 (Edge nurturing 等)
+        for h in list(self.driver.window_handles):
+            try:
+                self.driver.switch_to.window(h)
+                cur_url = (self.driver.current_url or "").lower()
+                if (cur_url.startswith("edge://") or cur_url.startswith("chrome://") or
+                        "nurturing" in cur_url):
+                    self.log(f"⚠ 關閉非課程 Edge 內建視窗: {cur_url[:60]}")
+                    self.driver.close()
+            except Exception:
+                pass
+        # 切回剩下任一視窗
+        try:
+            remaining = self.driver.window_handles
+            if remaining:
+                self.driver.switch_to.window(remaining[-1])
+                cur_url = (self.driver.current_url or "")[:60]
+                self.log(f"⚠ 沒找到課程 domain,留在 {cur_url}")
+        except Exception:
+            pass
+        return False
 
     def _detect_video_duration(self):
         """v1.8.30:偵測當前頁面 <video>.duration (秒)。跨 frame 找;找不到回 None。
