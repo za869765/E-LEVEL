@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.27"
+VERSION = "1.8.28"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2638,6 +2638,7 @@ class EClassApp:
         # v1.8.25/26/27:每門課第一次找到章節時 dump 標題,後續 cycle 不再 dump
         # v1.8.27:dump 邏輯移到 _find_chapters 內(在 frame context 抓 outerHTML 避免 stale)
         self._chapter_found_logged = False
+        self._chapter_selectors_probed = False  # v1.8.28:每門課首次探測所有 selector(診斷用)
         # v1.8.16：進 loop 前先確保在上課頁面（不在的話 _find_chapters 會空轉）
         try:
             if self._try_jump_to_lesson_sysbar():
@@ -2817,6 +2818,72 @@ class EClassApp:
             except Exception: pass
         return False
 
+    def _probe_in_current(self, ctx_label, selectors):
+        """v1.8.28:在當前 driver context(主頁或某 frame)探測所有 selector,印命中數+前 3 個標題"""
+        for sel in selectors:
+            try:
+                els = [e for e in self.driver.find_elements(By.CSS_SELECTOR, sel)
+                       if e.is_displayed()]
+                if not els:
+                    continue
+                titles = []
+                for e in els[:3]:
+                    try:
+                        t = (e.get_attribute("title") or e.text or "").strip()
+                        t = t.replace("\n", " ")[:40]
+                        if not t:
+                            cls = (e.get_attribute("class") or "")[:20]
+                            t = f"({e.tag_name}.{cls})"
+                        titles.append(t)
+                    except Exception:
+                        titles.append("(read err)")
+                more = f" +{len(els)-3}" if len(els) > 3 else ""
+                self.log(f"  🔍[{ctx_label}] {sel} → {len(els)}: {' / '.join(titles)}{more}")
+            except Exception:
+                pass
+
+    def _probe_all_selectors(self, selectors):
+        """v1.8.28:診斷工具 — 遍歷主頁與各 frame,把所有 selector 命中 dump 出來
+        每門課只跑一次(由 _chapter_selectors_probed 控制),用來找出真正章節的 selector
+        """
+        self.log("🔍 v1.8.28 selector 診斷開始(只跑一次)...")
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        self._probe_in_current("主頁面", selectors)
+        try:
+            for frame in self._all_frames():
+                fid = frame.get_attribute("id") or ""
+                fname = frame.get_attribute("name") or ""
+                label = f"frame[{fid or fname or '?'}]"
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(frame)
+                    self._probe_in_current(label, selectors)
+                    for inner in self._all_frames():
+                        iid = inner.get_attribute("id") or ""
+                        iname = inner.get_attribute("name") or ""
+                        ilabel = f"{label}>nested[{iid or iname or '?'}]"
+                        try:
+                            self.driver.switch_to.frame(inner)
+                            self._probe_in_current(ilabel, selectors)
+                            self.driver.switch_to.parent_frame()
+                        except Exception:
+                            try: self.driver.switch_to.parent_frame()
+                            except Exception: pass
+                except Exception:
+                    pass
+                finally:
+                    try: self.driver.switch_to.default_content()
+                    except Exception: pass
+        except Exception:
+            pass
+        finally:
+            try: self.driver.switch_to.default_content()
+            except Exception: pass
+        self.log("🔍 v1.8.28 selector 診斷結束")
+
     def _dump_chapter_titles(self, els, where_label):
         """v1.8.27:在 frame context 內 dump 章節 — 避免後續切回 default_content 後 stale。
         每門課第一次找到時印一次,後續 cycle 不再 dump。
@@ -2889,6 +2956,11 @@ class EClassApp:
             "li[style*='cursor']",
             "span[style*='cursor:pointer']",
         ]
+
+        # v1.8.28:每門課第一次完整探測所有 selector(診斷用),不影響主邏輯
+        if not getattr(self, '_chapter_selectors_probed', False):
+            self._chapter_selectors_probed = True
+            self._probe_all_selectors(selectors)
 
         # 主頁面找一次
         for sel in selectors:
