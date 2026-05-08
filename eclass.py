@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.29"
+VERSION = "1.8.30"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2652,6 +2652,11 @@ class EClassApp:
         local_cycle = 0
         no_chapter_count = 0
         start_time = time.time()
+        # v1.8.30:頁面停留控制 — 偵測影片時長,沒影片 default 30 分鐘
+        last_advance_at = None
+        current_page_dur = 30 * 60.0   # default 30 分鐘
+        self._video_duration_logged = False
+        self._video_default_logged = False
         # v1.8.22：「閱讀閒置提醒」對話框首次偵測時間戳
         idle_dlg_first_seen = None
         IDLE_DLG_TIMEOUT = 270  # 秒；站方倒數 297 秒，留 27 秒緩衝主動跳考避險
@@ -2708,14 +2713,31 @@ class EClassApp:
                     self.log(f"已上課 {elapsed_min:.0f} 分鐘，達 target({target_min:g} 分)，切換測驗/問卷")
                     return
 
-            # v1.8.29:優先試 pathtree.nextStep(1)(衛生福利e學園真正推進方式);
-            #          失敗才退化到點 SCO 章節元素(其他平台)
-            #          原因:_find_chapters 在衛生福利e學園抓到的 3 個 SCO 都是 meta(環境檢測/勘誤),
-            #          點它們不會累時數;真章節靠 pathtree.nextStep 推進
-            if self._try_pathtree_advance():
+            # v1.8.29/30:優先試 pathtree.nextStep(1),依當前頁面影片時長控制推進頻率
+            #          (避免切換太快 — v1.8.29 每 cycle 推一次,11 章節 30 秒推完)
+            now_t = time.time()
+            should_advance = (last_advance_at is None) or \
+                             ((now_t - last_advance_at) >= current_page_dur)
+            if not should_advance:
+                # 還沒到該頁停留時間 → 不推進,讓外層 cycle 繼續做彈窗/URL/idle/30分鐘測驗檢查
+                pass
+            elif self._try_pathtree_advance():
+                last_advance_at = time.time()
                 no_chapter_count = 0
-                time.sleep(2)
+                # 偵測新頁影片時長,沒有就用 30 分 default
+                d = self._detect_video_duration()
+                if d and d > 0:
+                    current_page_dur = float(d)
+                    if not self._video_duration_logged:
+                        self._video_duration_logged = True
+                        self.log(f"⏰ 偵測到影片時長 {d:.0f} 秒,此頁停留(後續沉默)")
+                else:
+                    current_page_dur = 30 * 60.0
+                    if not self._video_default_logged:
+                        self._video_default_logged = True
+                        self.log("⚠ 偵測不到影片,此頁停留 30 分 default(後續沉默)")
             else:
+                # pathtree 不可用 → 退化點 SCO 章節元素(其他平台)
                 chapters = self._find_chapters()
                 if chapters:
                     # v1.8.27:章節 dump 已在 _find_chapters 內完成(frame context 還在,outerHTML 不會 stale)
@@ -2728,6 +2750,8 @@ class EClassApp:
                             time.sleep(0.5)
                         except (StaleElementReferenceException, WebDriverException):
                             break
+                    last_advance_at = time.time()
+                    current_page_dur = 30 * 60.0
                 else:
                     no_chapter_count += 1
                 if no_chapter_count <= 3:
@@ -2786,6 +2810,55 @@ class EClassApp:
         except Exception:
             pass
         return frames
+
+    def _detect_video_duration(self):
+        """v1.8.30:偵測當前頁面 <video>.duration (秒)。跨 frame 找;找不到回 None。
+        用於 _learning_loop 動態決定每頁停留時間,避免推進太快。
+        """
+        js = (
+            "var v = document.querySelector('video');"
+            "if (v && !isNaN(v.duration) && v.duration > 0) return v.duration;"
+            "return null;"
+        )
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+        try:
+            d = self.driver.execute_script(js)
+            if d:
+                return float(d)
+        except Exception:
+            pass
+        try:
+            for fr in self._all_frames():
+                try:
+                    self.driver.switch_to.default_content()
+                    self.driver.switch_to.frame(fr)
+                    d = self.driver.execute_script(js)
+                    if d:
+                        return float(d)
+                    for inner in self._all_frames():
+                        try:
+                            self.driver.switch_to.frame(inner)
+                            d = self.driver.execute_script(js)
+                            if d:
+                                return float(d)
+                            self.driver.switch_to.parent_frame()
+                        except Exception:
+                            try: self.driver.switch_to.parent_frame()
+                            except Exception: pass
+                except Exception:
+                    pass
+                finally:
+                    try: self.driver.switch_to.default_content()
+                    except Exception: pass
+        except Exception:
+            pass
+        finally:
+            try: self.driver.switch_to.default_content()
+            except Exception: pass
+        return None
 
     def _try_pathtree_advance(self):
         """v1.8.18：衛生福利e學園 章節由 JS pathtree 動態管理；
