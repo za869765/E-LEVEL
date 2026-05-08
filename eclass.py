@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.23"
+VERSION = "1.8.24"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -297,8 +297,9 @@ class EClassApp:
         self.qa_bank  = QABank(QA_BANK_FILE)
         self._gemini  = None              # v1.8.8: Gemini AI client
         self._current_course_title = ""   # 答題自動學習用
-        # v1.8.23：本門課程的權威狀態（從課程清單卡片抓取，主導 _process_current_course_page）
-        self._current_needs       = {"reading": False, "exam": False, "survey": False}
+        # v1.8.23/24：本門課程的權威狀態（從課程清單卡片抓取，主導 _process_current_course_page）
+        # v1.8.24：needs 改三態 None/True/False — None=沒抓到 step(不可短路),True/False=明確
+        self._current_needs       = {"reading": None, "exam": None, "survey": None}
         self._current_exam_score  = None  # 該課實際測驗分數（None=未知）
         self._current_exam_pass   = None  # 該課及格門檻（每課不同，None=未知）
         self._current_already_min = None  # 該課已上時數（分鐘，None=未知）
@@ -1563,14 +1564,17 @@ class EClassApp:
                     href = entry.get_attribute("href") or ""
                     if href:
                         self._tried_hrefs.add(href)
-                    title, needs_log, exam_score, exam_pass = self._extract_card_info(entry)
+                    title, needs_log, exam_score, exam_pass, had_steps = self._extract_card_info(entry)
                     self._current_course_title = title or ""
-                    # v1.8.23：badges + 分數 = 權威信號，主導後續 dispatch
-                    self._current_needs = {
-                        "reading": "未閱讀" in needs_log,
-                        "exam":    "未測驗" in needs_log,
-                        "survey":  "未問卷" in needs_log,
-                    }
+                    # v1.8.24：had_steps=True 才信任 needs 的 False;否則保 None(未知)
+                    if had_steps:
+                        self._current_needs = {
+                            "reading": "未閱讀" in needs_log,
+                            "exam":    "未測驗" in needs_log,
+                            "survey":  "未問卷" in needs_log,
+                        }
+                    else:
+                        self._current_needs = {"reading": None, "exam": None, "survey": None}
                     self._current_exam_score  = exam_score
                     self._current_exam_pass   = exam_pass
                     self._current_already_min = None  # 進詳情頁後 _log_course_info 解析
@@ -1634,7 +1638,7 @@ class EClassApp:
                         break
                     if href:
                         self._tried_hrefs.add(href)
-                    title, _needs_log, exam_score, exam_pass = self._extract_card_info(pend_entry)
+                    title, _needs_log, exam_score, exam_pass, _had = self._extract_card_info(pend_entry)
                     self._current_course_title = title or ""
                     # v1.8.23：補做場景 reason 已知；reading 視為已達標（不然不會出現在已完成）
                     self._current_needs = {
@@ -2025,22 +2029,32 @@ class EClassApp:
                 self.driver.get(DASHBOARD_URL)
                 return
 
-            # v1.8.23：badges + 分數 + 已上時數 三權威信號主導 dispatch
-            #   A. 時數短缺(已上 < 需要 OR 有「未閱讀」)→ _learning_loop 累時數
-            #   B. 測驗:score >= pass → 跳過;有「未測驗」或 score<pass → 嘗試
-            #   C. 問卷:有「未問卷」 → 嘗試;否則跳過
+            # v1.8.23/24：badges(三態) + 分數 + 已上時數 主導 dispatch
+            #   A. 時數短缺 → _learning_loop 累時數
+            #   B. 測驗:已及格→跳;明確未過或 needs.exam=True→試;needs=None→保守試
+            #   C. 問卷:needs.survey=True→試;明確 False 或 None→ 跳過
             needs   = self._current_needs
             score   = self._current_exam_score
             pass_   = self._current_exam_pass
             already = self._current_already_min
+            nr      = needs.get("reading")
+            ne      = needs.get("exam")
+            ns      = needs.get("survey")
             score_passed = (score is not None and pass_ is not None and score >= pass_)
             score_failed = (score is not None and pass_ is not None and score <  pass_)
+
+            # v1.8.24 P0-2 保險絲:時數短缺判斷三層退化
             if req_min and already is not None:
                 time_short = (already < req_min)
-            elif needs.get("reading"):
+            elif nr is True:
                 time_short = True
-            else:
+            elif nr is False:
                 time_short = False
+            else:
+                # 全無明確信號 — 有 req_min 就累兜底;否則跳過避免無謂上課
+                time_short = bool(req_min)
+                if time_short:
+                    self.log("⚠ 已上時數+badges 信號全失效,但有 req_min → 退化為無條件累時數")
             self.log(f"📊 決策摘要 needs={needs} score={score} pass={pass_} "
                      f"already={already} req={req_min} 時數短缺={time_short} 已及格={score_passed}")
 
@@ -2050,26 +2064,28 @@ class EClassApp:
                 self.log(f"【A】時數短缺(已上 {already or 0:g} / 需 {req_min},剩 {remaining:g} 分)→ 累積時數")
                 self._learning_loop(required_minutes=req_min, already_minutes=(already or 0))
             else:
-                self.log("【A】時數已達標(或資訊不足),跳過上課階段")
+                self.log("【A】時數已達標(或無需閱讀),跳過上課階段")
 
             # ── 階段 B：測驗 ──
             if score_passed:
                 self.log(f"【B】測驗已及格({score:g} ≥ {pass_:g}),跳過測驗")
-            elif score_failed or needs.get("exam"):
+            elif score_failed or ne is True or (ne is None and not score_passed):
                 if score_failed:
                     self.log(f"【B】分數 {score:g} < 及格 {pass_:g} → 嘗試重測")
-                else:
+                elif ne is True:
                     self.log("【B】偵測到「未測驗」 → 嘗試測驗")
+                else:
+                    self.log("【B】無明確信號(needs/分數皆未知)→ 保守嘗試測驗")
                 if self._try_jump_to_exam_sysbar():
                     self.log("⚡ 進入測驗模式")
                     self._auto_take_exam()
                 else:
                     self.log("⚠ 無法進入測驗頁,放棄本門測驗")
             else:
-                self.log("【B】無「未測驗」標籤且分數無法判定,跳過測驗")
+                self.log("【B】badges 明確不需測驗,跳過")
 
             # ── 階段 C：問卷 ──
-            if needs.get("survey"):
+            if ns is True:
                 self.log("【C】偵測到「未問卷」 → 嘗試填寫")
                 try:
                     if self._try_jump_to_survey_sysbar():
@@ -2079,8 +2095,19 @@ class EClassApp:
                         self.log("⚠ 無法進入問卷頁,放棄本門問卷")
                 except Exception as _e:
                     self.log(f"問卷處理錯誤: {_e}")
+            elif ns is None:
+                # 沒明確信號 — 保守試一次(原 v1.8.22 行為)
+                self.log("【C】無明確 badges 信號 → 保守嘗試問卷")
+                try:
+                    if self._try_jump_to_survey_sysbar():
+                        self.log("⚡ 進入問卷模式")
+                        self._auto_fill_player_survey()
+                    else:
+                        self.log("⚠ 無法進入問卷頁,跳過")
+                except Exception as _e:
+                    self.log(f"問卷處理錯誤: {_e}")
             else:
-                self.log("【C】無「未問卷」標籤,跳過問卷")
+                self.log("【C】badges 明確不需問卷,跳過")
 
             if len(self.driver.window_handles) > 1:
                 self.driver.close()
@@ -2095,11 +2122,13 @@ class EClassApp:
                 pass
 
     def _extract_card_info(self, el):
-        """從連結元素向上找卡片容器，回傳 (title, needs_log, exam_score, exam_pass)
+        """從連結元素向上找卡片容器，回傳 (title, needs_log, exam_score, exam_pass, had_steps)
         v1.8.23：加抓「測驗分數:X 分」與「及格分數:Y 分」(每課不同) 為權威信號之一
+        v1.8.24：had_steps=True 才能信任 needs 的 False 為「明確不需要」(否則三個都 done 跟沒抓到難分)
         """
         title, needs_log = "", ""
         exam_score, exam_pass = None, None
+        had_steps = False
         try:
             # 優先抓 e等公務園 的 course-list-block
             try:
@@ -2131,6 +2160,8 @@ class EClassApp:
             # 觀察各 step 是否完成（done class 表已完成）
             try:
                 steps = card.find_elements(By.CSS_SELECTOR, ".course-steps-bar .step")
+                if steps:
+                    had_steps = True   # v1.8.24：抓到 step → needs 的 False 才可信
                 for s in steps:
                     label = ""
                     try:
@@ -2142,7 +2173,8 @@ class EClassApp:
                         badges.append(f"未{label}")
             except Exception:
                 pass
-            if not badges:
+            if not badges and not had_steps:
+                # v1.8.24：只在「真的沒抓到 step」時才用 fallback 字串(避免污染權威信號)
                 if "閱讀時數" in ct:
                     badges.append("閱讀")
                 if "測驗" in ct:
@@ -2150,24 +2182,23 @@ class EClassApp:
                 if "問卷" in ct:
                     badges.append("問卷")
             needs_log = "/".join(badges)
-            # v1.8.23：抓「測驗分數」與「及格分數」(每課不同的及格門檻)
-            # 半形/全形冒號都試；及格門檻的字串可能是「及格分數/合格分數/通過分數/最低分數」
+            # v1.8.23/24：抓「測驗分數」與「及格分數」 — 取最後一筆(避免歷史紀錄誤導)
             try:
-                m = re.search(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', ct)
-                if m:
-                    exam_score = float(m.group(1))
+                ms = re.findall(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', ct)
+                if ms:
+                    exam_score = float(ms[-1])
             except Exception:
                 pass
             try:
-                m = re.search(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
-                              r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', ct)
-                if m:
-                    exam_pass = float(m.group(1))
+                ms = re.findall(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
+                                r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', ct)
+                if ms:
+                    exam_pass = float(ms[-1])
             except Exception:
                 pass
         except Exception:
             pass
-        return title, needs_log, exam_score, exam_pass
+        return title, needs_log, exam_score, exam_pass, had_steps
 
     def _click_next_page(self):
         """點下一頁按鈕，回傳 True=成功翻頁 / False=已是最後頁"""
@@ -2227,10 +2258,11 @@ class EClassApp:
             if req:
                 self.log(f"時數門檻：需上課至少 {req} 分鐘（總時數 50%）")
 
-            # v1.8.23：嘗試解析「已上時數」— 多 pattern,抓不到回 None
+            # v1.8.24：嘗試解析「已上時數」— 移除「閱讀」前綴(會誤匹配「閱讀時數」門檻字串)
+            #         必須有「已上/目前/累計/本次/現有」等明確「已完成」語意的前綴
             already = None
             for pat in (
-                r'(?:已上|目前|累計|本次|現有|閱讀)'
+                r'(?:已上|目前|累計|本次|現有)'
                 r'\s*(?:閱讀|上課|學習|課程)?\s*時數\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分',
                 r'(?:已上|目前|累計|本次)\s*(\d+(?:\.\d+)?)\s*分',
             ):
@@ -2242,16 +2274,16 @@ class EClassApp:
                 self.log(f"✓ 已上時數：{already:g} 分鐘")
                 self._current_already_min = already
 
-            # v1.8.23：詳情頁補抓分數/及格門檻（卡片若無）
+            # v1.8.24：詳情頁補抓分數/及格門檻 — 用 findall 取最後一筆(避免歷史紀錄)
             if self._current_exam_score is None:
-                m4 = re.search(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
-                if m4:
-                    self._current_exam_score = float(m4.group(1))
+                ms = re.findall(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
+                if ms:
+                    self._current_exam_score = float(ms[-1])
             if self._current_exam_pass is None:
-                m5 = re.search(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
-                               r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
-                if m5:
-                    self._current_exam_pass = float(m5.group(1))
+                ms = re.findall(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
+                                r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
+                if ms:
+                    self._current_exam_pass = float(ms[-1])
         except Exception:
             pass
         return req
@@ -2719,9 +2751,11 @@ class EClassApp:
                     self.log("該課已達上課時數")
                     return
 
-            # 播放器內最多 50 次循環後返回，繼續做測驗/問卷
-            if "elearn.hrd.gov.tw" in self.driver.current_url and local_cycle >= 50:
-                self.log("播放器上課循環已達上限，準備進行測驗和問卷")
+            # v1.8.24：移除 50 cycle 硬限制(實測 50 cycle ≈ 2 分鐘,完全不夠 req_min);
+            #          target_min 主導退出條件;90 分鐘超時兜底防無限循環
+            if (time.time() - start_time) >= 90 * 60:
+                elapsed_min = (time.time() - start_time) / 60
+                self.log(f"⏰ _learning_loop 已跑 {elapsed_min:.0f} 分 ≥ 90 分硬上限,退出兜底")
                 return
 
     def _all_frames(self):
@@ -3159,11 +3193,11 @@ class EClassApp:
     def _survey_already_done(self):
         """v1.8.7：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
         看到任一 → 立刻 return True，主流程直接跳下一門課，不空等。
-        v1.8.23：badges 說「未問卷」時短路 return False（DOM 權威信號優先於字串 heuristic）
+        v1.8.23/24：badges 明確「未問卷」(is True) 時短路;needs=None 走兜底字串 match
         """
-        # v1.8.23：badges 主導 — 課程清單說要填,跳過字串 match
+        # v1.8.24：嚴格 `is True`(而非 truthy) — 避免 None 也誤觸短路
         needs = getattr(self, "_current_needs", {}) or {}
-        if needs.get("survey"):
+        if needs.get("survey") is True:
             return False
 
         DONE_KEYS = ("修改問卷", "查看問卷", "查看結果", "已填寫", "已繳交",
