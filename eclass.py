@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.22"
+VERSION = "1.8.23"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -297,6 +297,11 @@ class EClassApp:
         self.qa_bank  = QABank(QA_BANK_FILE)
         self._gemini  = None              # v1.8.8: Gemini AI client
         self._current_course_title = ""   # 答題自動學習用
+        # v1.8.23：本門課程的權威狀態（從課程清單卡片抓取，主導 _process_current_course_page）
+        self._current_needs       = {"reading": False, "exam": False, "survey": False}
+        self._current_exam_score  = None  # 該課實際測驗分數（None=未知）
+        self._current_exam_pass   = None  # 該課及格門檻（每課不同，None=未知）
+        self._current_already_min = None  # 該課已上時數（分鐘，None=未知）
         # 累計本次執行所有「題庫沒命中」題目，stop 時 dump 到 qa_missed.json
         self._missed_questions = {}
         # v1.8.7：選項 cycling — 記錄每題試過的選項，避免下一次重蹈覆轍
@@ -1558,10 +1563,23 @@ class EClassApp:
                     href = entry.get_attribute("href") or ""
                     if href:
                         self._tried_hrefs.add(href)
-                    title, needs_log = self._extract_card_info(entry)
+                    title, needs_log, exam_score, exam_pass = self._extract_card_info(entry)
                     self._current_course_title = title or ""
+                    # v1.8.23：badges + 分數 = 權威信號，主導後續 dispatch
+                    self._current_needs = {
+                        "reading": "未閱讀" in needs_log,
+                        "exam":    "未測驗" in needs_log,
+                        "survey":  "未問卷" in needs_log,
+                    }
+                    self._current_exam_score  = exam_score
+                    self._current_exam_pass   = exam_pass
+                    self._current_already_min = None  # 進詳情頁後 _log_course_info 解析
+                    extras = []
+                    if exam_score is not None: extras.append(f"分數={exam_score:g}")
+                    if exam_pass  is not None: extras.append(f"及格={exam_pass:g}")
                     self.log(f"── 進入課程: {title or '(課程)'}"
-                             + (f" [{needs_log}]" if needs_log else ""))
+                             + (f" [{needs_log}]" if needs_log else "")
+                             + ((" " + " ".join(extras)) if extras else ""))
                     self.driver.execute_script("arguments[0].click()", entry)
                     time.sleep(3)
                     self._process_current_course_page()
@@ -1616,7 +1634,17 @@ class EClassApp:
                         break
                     if href:
                         self._tried_hrefs.add(href)
-                    title, _ = self._extract_card_info(pend_entry)
+                    title, _needs_log, exam_score, exam_pass = self._extract_card_info(pend_entry)
+                    self._current_course_title = title or ""
+                    # v1.8.23：補做場景 reason 已知；reading 視為已達標（不然不會出現在已完成）
+                    self._current_needs = {
+                        "reading": False,
+                        "exam":    (reason == "exam"),
+                        "survey":  (reason == "survey"),
+                    }
+                    self._current_exam_score  = exam_score
+                    self._current_exam_pass   = exam_pass
+                    self._current_already_min = None
                     label = {"exam": "補做測驗", "survey": "補做問卷"}.get(reason, "補做")
                     self.log(f"── {label}: {title or '(課程)'}")
                     self.driver.execute_script("arguments[0].click()", pend_entry)
@@ -1997,51 +2025,62 @@ class EClassApp:
                 self.driver.get(DASHBOARD_URL)
                 return
 
-            # ★ 新策略（v1.6.1）：上課、測驗、問卷 為三件獨立必做事
-            #   「測驗/考試」「問卷/評價」都是除了上課以外必須去完成的
-            #   流程：
-            #     1. 先試「測驗/考試」 — 能進就先考完
-            #     2. 再試「問卷/評價」 — 能填就先填完
-            #     3. 若上述兩件都還做不了，且時數未達標 → 跑 _learning_loop 累積時數
-            #        累完再回頭跑一輪「測驗 + 問卷」
-            #     4. 若測驗/問卷其中之一已完成（jumped=True），剩下時數仍可能未達標
-            #        但不再強制 _learning_loop（依使用者規則：能測驗 = 時數已達標）
-            exam_done    = False
-            survey_done  = False
-
-            self.log("【1/3】嘗試直接進入測驗/考試...")
-            if self._try_jump_to_exam_sysbar():
-                self.log("⚡ 進入測驗模式（時數已達標）")
-                self._auto_take_exam()
-                exam_done = True
+            # v1.8.23：badges + 分數 + 已上時數 三權威信號主導 dispatch
+            #   A. 時數短缺(已上 < 需要 OR 有「未閱讀」)→ _learning_loop 累時數
+            #   B. 測驗:score >= pass → 跳過;有「未測驗」或 score<pass → 嘗試
+            #   C. 問卷:有「未問卷」 → 嘗試;否則跳過
+            needs   = self._current_needs
+            score   = self._current_exam_score
+            pass_   = self._current_exam_pass
+            already = self._current_already_min
+            score_passed = (score is not None and pass_ is not None and score >= pass_)
+            score_failed = (score is not None and pass_ is not None and score <  pass_)
+            if req_min and already is not None:
+                time_short = (already < req_min)
+            elif needs.get("reading"):
+                time_short = True
             else:
-                self.log("目前無法進測驗（可能時數不足或已完成）")
+                time_short = False
+            self.log(f"📊 決策摘要 needs={needs} score={score} pass={pass_} "
+                     f"already={already} req={req_min} 時數短缺={time_short} 已及格={score_passed}")
 
-            self.log("【2/3】嘗試直接進入問卷/評價...")
-            try:
-                if self._try_jump_to_survey_sysbar():
-                    self.log("⚡ 進入問卷模式（直接填寫）")
-                    self._auto_fill_player_survey()
-                    survey_done = True
+            # ── 階段 A：時數 ──
+            if time_short:
+                remaining = req_min - (already or 0)
+                self.log(f"【A】時數短缺(已上 {already or 0:g} / 需 {req_min},剩 {remaining:g} 分)→ 累積時數")
+                self._learning_loop(required_minutes=req_min, already_minutes=(already or 0))
+            else:
+                self.log("【A】時數已達標(或資訊不足),跳過上課階段")
+
+            # ── 階段 B：測驗 ──
+            if score_passed:
+                self.log(f"【B】測驗已及格({score:g} ≥ {pass_:g}),跳過測驗")
+            elif score_failed or needs.get("exam"):
+                if score_failed:
+                    self.log(f"【B】分數 {score:g} < 及格 {pass_:g} → 嘗試重測")
                 else:
-                    self.log("目前無法進問卷（可能尚未開放或已完成）")
-            except Exception as _e:
-                self.log(f"問卷處理錯誤: {_e}")
-
-            # v1.8.16：條件改成「只要測驗沒過就要回上課」
-            # （之前 `not exam_done and not survey_done` → 問卷單獨 done 時就跳過上課，
-            # 但問卷可獨立完成不代表時數夠 → 測驗永遠考不了）
-            if not exam_done:
-                self.log("【3/3】測驗未能直接進行 → 進入上課累積時數...")
-                self._learning_loop(required_minutes=req_min)
-                self.log("時數累積結束，再次嘗試測驗...")
-                self._auto_take_exam()
-                if not survey_done:
-                    self.log("再次嘗試問卷...")
-                    self._auto_fill_player_survey()
+                    self.log("【B】偵測到「未測驗」 → 嘗試測驗")
+                if self._try_jump_to_exam_sysbar():
+                    self.log("⚡ 進入測驗模式")
+                    self._auto_take_exam()
+                else:
+                    self.log("⚠ 無法進入測驗頁,放棄本門測驗")
             else:
-                self.log(f"本課程處理結果：測驗={'✓' if exam_done else '×'} "
-                         f"問卷={'✓' if survey_done else '×'}")
+                self.log("【B】無「未測驗」標籤且分數無法判定,跳過測驗")
+
+            # ── 階段 C：問卷 ──
+            if needs.get("survey"):
+                self.log("【C】偵測到「未問卷」 → 嘗試填寫")
+                try:
+                    if self._try_jump_to_survey_sysbar():
+                        self.log("⚡ 進入問卷模式")
+                        self._auto_fill_player_survey()
+                    else:
+                        self.log("⚠ 無法進入問卷頁,放棄本門問卷")
+                except Exception as _e:
+                    self.log(f"問卷處理錯誤: {_e}")
+            else:
+                self.log("【C】無「未問卷」標籤,跳過問卷")
 
             if len(self.driver.window_handles) > 1:
                 self.driver.close()
@@ -2056,8 +2095,11 @@ class EClassApp:
                 pass
 
     def _extract_card_info(self, el):
-        """從連結元素向上找卡片容器，回傳 (title, needs_log)"""
+        """從連結元素向上找卡片容器，回傳 (title, needs_log, exam_score, exam_pass)
+        v1.8.23：加抓「測驗分數:X 分」與「及格分數:Y 分」(每課不同) 為權威信號之一
+        """
         title, needs_log = "", ""
+        exam_score, exam_pass = None, None
         try:
             # 優先抓 e等公務園 的 course-list-block
             try:
@@ -2108,9 +2150,24 @@ class EClassApp:
                 if "問卷" in ct:
                     badges.append("問卷")
             needs_log = "/".join(badges)
+            # v1.8.23：抓「測驗分數」與「及格分數」(每課不同的及格門檻)
+            # 半形/全形冒號都試；及格門檻的字串可能是「及格分數/合格分數/通過分數/最低分數」
+            try:
+                m = re.search(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', ct)
+                if m:
+                    exam_score = float(m.group(1))
+            except Exception:
+                pass
+            try:
+                m = re.search(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
+                              r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', ct)
+                if m:
+                    exam_pass = float(m.group(1))
+            except Exception:
+                pass
         except Exception:
             pass
-        return title, needs_log
+        return title, needs_log, exam_score, exam_pass
 
     def _click_next_page(self):
         """點下一頁按鈕，回傳 True=成功翻頁 / False=已是最後頁"""
@@ -2139,30 +2196,65 @@ class EClassApp:
         return False
 
     def _log_course_info(self):
-        """印出課程時數資訊，回傳需要上課的分鐘數（50% 門檻），0 代表未知"""
+        """印出課程時數資訊與相關權威信號，回傳需要上課的分鐘數（50% 門檻），0 代表未知。
+        v1.8.23：多行 dump 詳情頁所有時數/分數/及格相關行；嘗試解析「已上時數」存到
+                 self._current_already_min；補抓 exam_score/exam_pass（卡片若沒抓到時）。
+        """
+        req = 0
         try:
             body = self.driver.find_element(By.TAG_NAME, "body").text
-            for line in body.split("\n"):
-                if ("分鐘" in line or "小時" in line) and \
-                        ("認證" in line or "時數" in line or "上課" in line or "認定" in line):
-                    self.log(line.strip())
-                    break
-            # 解析小時數 → 50% 門檻（分鐘）
+
+            # v1.8.23：多行 dump（給階段 2 收斂 selector 用）
+            KEYS = ("分鐘", "小時", "時數", "分數", "及格", "合格", "通過",
+                    "閱讀", "上課", "認證", "認定", "滿分", "門檻")
+            seen = set()
+            for raw in body.split("\n"):
+                line = raw.strip()
+                if not line or line in seen or len(line) > 80:
+                    continue
+                if any(k in line for k in KEYS):
+                    self.log(f"📋 {line}")
+                    seen.add(line)
+
+            # 解析時數門檻（50%）
             m = re.search(r'(\d+(?:\.\d+)?)\s*小時', body)
             if m:
-                total_min = float(m.group(1)) * 60
-                req = int(total_min * 0.5)
+                req = int(float(m.group(1)) * 60 * 0.5)
+            else:
+                m2 = re.search(r'(\d+)\s*分鐘', body)
+                if m2:
+                    req = int(int(m2.group(1)) * 0.5)
+            if req:
                 self.log(f"時數門檻：需上課至少 {req} 分鐘（總時數 50%）")
-                return req
-            # 只有分鐘表示
-            m2 = re.search(r'(\d+)\s*分鐘', body)
-            if m2:
-                req = int(int(m2.group(1)) * 0.5)
-                self.log(f"時數門檻：需上課至少 {req} 分鐘（總時數 50%）")
-                return req
+
+            # v1.8.23：嘗試解析「已上時數」— 多 pattern,抓不到回 None
+            already = None
+            for pat in (
+                r'(?:已上|目前|累計|本次|現有|閱讀)'
+                r'\s*(?:閱讀|上課|學習|課程)?\s*時數\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分',
+                r'(?:已上|目前|累計|本次)\s*(\d+(?:\.\d+)?)\s*分',
+            ):
+                m3 = re.search(pat, body)
+                if m3:
+                    already = float(m3.group(1))
+                    break
+            if already is not None:
+                self.log(f"✓ 已上時數：{already:g} 分鐘")
+                self._current_already_min = already
+
+            # v1.8.23：詳情頁補抓分數/及格門檻（卡片若無）
+            if self._current_exam_score is None:
+                m4 = re.search(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
+                if m4:
+                    self._current_exam_score = float(m4.group(1))
+            if self._current_exam_pass is None:
+                m5 = re.search(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
+                               r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
+                if m5:
+                    self._current_exam_pass = float(m5.group(1))
         except Exception:
             pass
-        return 0
+        return req
 
     def _check_course_complete(self):
         try:
@@ -2497,7 +2589,14 @@ class EClassApp:
         return self._try_jump_to_sysbar_link(
             ["開始上課", "lesson", "play"], "開始上課")
 
-    def _learning_loop(self, required_minutes=0):
+    def _learning_loop(self, required_minutes=0, already_minutes=0):
+        """v1.8.23：accept already_minutes 起點，目標 = max(0, required - already)。
+        若 already 已達/超過 required，立即返回不再上課。
+        """
+        target_min = max(0, required_minutes - already_minutes)
+        if required_minutes and target_min == 0:
+            self.log(f"✓ 時數已達標(已上 {already_minutes:g} ≥ 需 {required_minutes} 分)，跳過上課階段")
+            return
         # v1.8.16：進 loop 前先確保在上課頁面（不在的話 _find_chapters 會空轉）
         try:
             if self._try_jump_to_lesson_sysbar():
@@ -2505,7 +2604,7 @@ class EClassApp:
                 self._human_sleep(2.0, 0.5)
         except Exception:
             pass
-        self.log("開始上課！請專心聽講......")
+        self.log(f"開始上課！請專心聽講......(目標再上 {target_min:g} 分鐘)")
         check_every = 10   # 每 10 次循環做一次時數確認（內部固定值）
         local_cycle = 0
         no_chapter_count = 0
@@ -2514,11 +2613,10 @@ class EClassApp:
         idle_dlg_first_seen = None
         IDLE_DLG_TIMEOUT = 270  # 秒；站方倒數 297 秒，留 27 秒緩衝主動跳考避險
 
-        # v1.8.20：第一次進場立刻檢查能否測驗（避免漏掉時數已達標）；
-        # 之後改為每 30 分鐘才再確認一次（避免每 cycle 都跳測驗頁）
+        # v1.8.20：第一次進場立刻檢查能否測驗(避免漏掉)；之後每 30 分鐘確認一次
         EXAM_CHECK_INTERVAL = 30 * 60  # 秒
         if self._can_take_exam_now():
-            self.log("⚡ 進場即偵測到「進行測驗」可點 — 時數已達標，跳過播放階段")
+            self.log("⚡ 進場偵測到「進行測驗」可點，跳過播放階段")
             return
         last_exam_check = time.time()
 
@@ -2560,11 +2658,11 @@ class EClassApp:
                     self.log(f"⚡ 上課 {elapsed_min:.0f} 分後偵測到「進行測驗」可點 — 跳過播放階段")
                     return
 
-            # ── 時數門檻：已達 50% 即退出，進行測驗/問卷 ──
-            if required_minutes > 0:
+            # ── 時數門檻：v1.8.23 改用 target_min(扣掉已上時數) ──
+            if target_min > 0:
                 elapsed_min = (time.time() - start_time) / 60
-                if elapsed_min >= required_minutes:
-                    self.log(f"已上課 {elapsed_min:.0f} 分鐘，達到時數門檻（{required_minutes}分），切換測驗/問卷")
+                if elapsed_min >= target_min:
+                    self.log(f"已上課 {elapsed_min:.0f} 分鐘，達 target({target_min:g} 分)，切換測驗/問卷")
                     return
 
             chapters = self._find_chapters()
@@ -2788,7 +2886,8 @@ class EClassApp:
 
     def _can_take_exam_now(self):
         """檢查是否在任一 frame 中存在可點擊的「進行測驗」按鈕。
-        ★ 使用者規則：能進行測驗 = 時數已達標。
+        v1.8.23 註：按鈕存在性 != 時數已達標(舊版誤把這個當代理信號);
+                  時數判斷改由 _process_current_course_page 用 已上時數 vs req_min 主導。
         v1.6.2：用 normalize-space(.) 搜後代文字（避免按鈕含內層 div 抓不到）
         """
         # 多個 XPath candidate，優先匹配按鈕類 tag/class
@@ -2970,9 +3069,26 @@ class EClassApp:
 
     def _exam_already_passed(self):
         """v1.8.20：偵測測驗已通過（避免重做）。
-        指標：頁面跨 frame 含「已通過/恭喜通過/通過測驗/測驗已通過/合格/查看測驗結果」之一，
-              且 NOT 含「未通過/不及格/重新測驗/再次測驗/尚未通過」（避免誤判 fail 頁面）。
+        v1.8.23 優先級:
+          P1. 明確分數比對(每課及格門檻不同) → 直接判定
+          P2. badges 主導(沒分數時) → needs[exam]=True→還沒過/False→已過
+          P3. 都失效時走原字串 match 兜底
         """
+        # P1. 明確比對(分數 + 該課及格門檻;避免硬編 60)
+        score = getattr(self, "_current_exam_score", None)
+        pass_ = getattr(self, "_current_exam_pass",  None)
+        if score is not None and pass_ is not None:
+            return score >= pass_
+
+        # P2. badges
+        needs = getattr(self, "_current_needs", {}) or {}
+        ne = needs.get("exam")
+        if ne is True:
+            return False
+        if ne is False:
+            return True
+
+        # P3. 字串 match 兜底
         PASS_KEYS = ("恭喜通過", "已通過", "通過測驗", "測驗已通過",
                      "測驗合格", "查看測驗結果", "查看成績")
         FAIL_KEYS = ("未通過", "不及格", "未達及格", "重新測驗",
@@ -3043,7 +3159,13 @@ class EClassApp:
     def _survey_already_done(self):
         """v1.8.7：快速偵測問卷已填寫（跨 frame 找「修改問卷／查看問卷／已填寫／已繳交」）
         看到任一 → 立刻 return True，主流程直接跳下一門課，不空等。
+        v1.8.23：badges 說「未問卷」時短路 return False（DOM 權威信號優先於字串 heuristic）
         """
+        # v1.8.23：badges 主導 — 課程清單說要填,跳過字串 match
+        needs = getattr(self, "_current_needs", {}) or {}
+        if needs.get("survey"):
+            return False
+
         DONE_KEYS = ("修改問卷", "查看問卷", "查看結果", "已填寫", "已繳交",
                      "已完成", "重新填寫")
         # XPath 一次抓所有「按鈕級別」的元素
@@ -3209,7 +3331,13 @@ class EClassApp:
             if self._can_fill_survey_now():
                 self.log(f"✓ 偵測到可填問卷（第{i+1}秒）")
                 return True
-        self.log("⚠ 已點問卷連結，但 12 秒內未偵測到可填問卷按鈕")
+        # v1.8.23：失敗時印實際到達位置(判斷點驗證)
+        try:
+            cur_url   = (self.driver.current_url or "")[:80]
+            cur_title = (self.driver.title or "")[:40]
+        except Exception:
+            cur_url, cur_title = "?", "?"
+        self.log(f"⚠ 已點問卷連結，但 12 秒內未偵測到可填問卷按鈕 — URL={cur_url} title={cur_title}")
         return False
 
     def _try_jump_to_exam_sysbar(self):
@@ -3225,7 +3353,13 @@ class EClassApp:
                 info = getattr(self, "_last_exam_btn_info", "?")
                 self.log(f"✓ 偵測到「進行測驗」按鈕（第{i+1}秒，{info}）")
                 return True
-        self.log("⚠ 已點測驗連結，但 12 秒內未偵測到「進行測驗」按鈕")
+        # v1.8.23：失敗時印實際到達位置(判斷點驗證)
+        try:
+            cur_url   = (self.driver.current_url or "")[:80]
+            cur_title = (self.driver.title or "")[:40]
+        except Exception:
+            cur_url, cur_title = "?", "?"
+        self.log(f"⚠ 已點測驗連結，但 12 秒內未偵測到「進行測驗」按鈕 — URL={cur_url} title={cur_title}")
         return False
 
     # ── 課程播放器：自動測驗 ─────────────────────────────────
