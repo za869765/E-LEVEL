@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.26"
+VERSION = "1.8.27"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2635,9 +2635,9 @@ class EClassApp:
         if required_minutes and target_min == 0:
             self.log(f"✓ 時數已達標(已上 {already_minutes:g} ≥ 需 {required_minutes} 分)，跳過上課階段")
             return
-        # v1.8.25/26:每門課第一次找到章節時 dump 標題,後續 cycle 不再 dump
-        self._chapters_dumped = False
-        self._chapter_found_logged = False  # v1.8.26:_find_chapters 找到 log 也只印一次
+        # v1.8.25/26/27:每門課第一次找到章節時 dump 標題,後續 cycle 不再 dump
+        # v1.8.27:dump 邏輯移到 _find_chapters 內(在 frame context 抓 outerHTML 避免 stale)
+        self._chapter_found_logged = False
         # v1.8.16：進 loop 前先確保在上課頁面（不在的話 _find_chapters 會空轉）
         try:
             if self._try_jump_to_lesson_sysbar():
@@ -2708,27 +2708,7 @@ class EClassApp:
 
             chapters = self._find_chapters()
             if chapters:
-                # v1.8.25/26:首次找到章節時 dump 標題,讓 log 看到實際 DOM
-                if not self._chapters_dumped:
-                    self._chapters_dumped = True
-                    self.log(f"📖 章節清單(共 {len(chapters)} 個):")
-                    for i, ch in enumerate(chapters[:20], 1):
-                        try:
-                            title_attr = (ch.get_attribute("title") or "").strip()
-                            text_val   = (ch.text or "").strip()
-                            display = title_attr or text_val
-                            if not display:
-                                # v1.8.26:title/text 都空 → 印 outerHTML 切短(讓我們看 DOM 結構)
-                                outer = ch.get_attribute("outerHTML") or ""
-                                display = "[outerHTML] " + outer.replace("\n", " ").strip()[:120]
-                            else:
-                                display = display.replace("\n", " ")[:80]
-                            tag = ch.tag_name
-                            self.log(f"   [{i}] tag={tag} {display}")
-                        except Exception as _e:
-                            self.log(f"   [{i}] (讀取錯誤: {_e})")
-                    if len(chapters) > 20:
-                        self.log(f"   ...(其他 {len(chapters)-20} 個略)")
+                # v1.8.27:章節 dump 已在 _find_chapters 內完成(frame context 還在,outerHTML 不會 stale)
                 no_chapter_count = 0
                 for ch in chapters:
                     if not self.running:
@@ -2837,6 +2817,31 @@ class EClassApp:
             except Exception: pass
         return False
 
+    def _dump_chapter_titles(self, els, where_label):
+        """v1.8.27:在 frame context 內 dump 章節 — 避免後續切回 default_content 後 stale。
+        每門課第一次找到時印一次,後續 cycle 不再 dump。
+        """
+        if getattr(self, '_chapter_found_logged', False):
+            return
+        self._chapter_found_logged = True
+        self.log(f"📖 在 {where_label} 找到 {len(els)} 個章節:")
+        for i, ch in enumerate(els[:20], 1):
+            try:
+                title_attr = (ch.get_attribute("title") or "").strip()
+                text_val   = (ch.text or "").strip()
+                display = title_attr or text_val
+                if not display:
+                    outer = ch.get_attribute("outerHTML") or ""
+                    display = "[outerHTML] " + outer.replace("\n", " ").strip()[:120]
+                else:
+                    display = display.replace("\n", " ")[:80]
+                tag = ch.tag_name
+                self.log(f"   [{i}] tag={tag} {display}")
+            except Exception as _e:
+                self.log(f"   [{i}] (讀取錯誤: {str(_e)[:80]})")
+        if len(els) > 20:
+            self.log(f"   ...(其他 {len(els)-20} 個略)")
+
     def _find_chapters(self):
         """衛生福利e學園 用 <frame> 而非 <iframe>，章節在 s_catalog frame
         中華 e等公務園 等其他平台則直接在 main page 或 iframe 內
@@ -2891,6 +2896,7 @@ class EClassApp:
                 els = [e for e in self.driver.find_elements(By.CSS_SELECTOR, sel)
                        if e.is_displayed()]
                 if len(els) >= 2:
+                    self._dump_chapter_titles(els, f"主頁面 ({sel})")
                     return els
             except Exception:
                 continue
@@ -2910,9 +2916,7 @@ class EClassApp:
                             if len(els) >= 2:
                                 # 注意：呼叫端會在 frame context 中操作這些元素
                                 # 若有 stale，必須回到 default_content 重抓
-                                if not getattr(self, '_chapter_found_logged', False):
-                                    self._chapter_found_logged = True
-                                    self.log(f"在 frame[{fid or fname}] 找到 {len(els)} 個章節 ({sel})")
+                                self._dump_chapter_titles(els, f"frame[{fid or fname}] ({sel})")
                                 return els
                         except Exception:
                             pass
@@ -2925,9 +2929,7 @@ class EClassApp:
                                     els = [e for e in self.driver.find_elements(
                                             By.CSS_SELECTOR, sel) if e.is_displayed()]
                                     if len(els) >= 2:
-                                        if not getattr(self, '_chapter_found_logged', False):
-                                            self._chapter_found_logged = True
-                                            self.log(f"在 nested frame 找到 {len(els)} 個章節 ({sel})")
+                                        self._dump_chapter_titles(els, f"nested frame ({sel})")
                                         return els
                                 except Exception:
                                     pass
