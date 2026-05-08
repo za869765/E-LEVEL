@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.32"
+VERSION = "1.8.33"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2653,7 +2653,7 @@ class EClassApp:
         start_time = time.time()
         # v1.8.30:頁面停留控制 — 偵測影片時長,沒影片 default 30 分鐘
         last_advance_at = None
-        current_page_dur = 30 * 60.0   # default 30 分鐘
+        current_page_dur = 30.0   # v1.8.33:沒影片時 30 秒(快速推進文字頁;之前 30 分鐘卡死)
         self._video_duration_logged = False
         self._video_default_logged = False
         # v1.8.31:每 30 秒印一次精準狀態,取代每 cycle「第N次」噪訊
@@ -2733,10 +2733,10 @@ class EClassApp:
                         self._video_duration_logged = True
                         self.log(f"⏰ 偵測到影片時長 {d:.0f} 秒,此頁停留(後續沉默)")
                 else:
-                    current_page_dur = 30 * 60.0
+                    current_page_dur = 30.0
                     if not self._video_default_logged:
                         self._video_default_logged = True
-                        self.log("⚠ 偵測不到影片,此頁停留 30 分 default(後續沉默)")
+                        self.log("⚠ 偵測不到影片,此頁停留 30 秒(快速推進)— 後續沉默")
             else:
                 # pathtree 不可用 → 退化點 SCO 章節元素(其他平台)
                 chapters = self._find_chapters()
@@ -2752,7 +2752,7 @@ class EClassApp:
                         except (StaleElementReferenceException, WebDriverException):
                             break
                     last_advance_at = time.time()
-                    current_page_dur = 30 * 60.0
+                    current_page_dur = 30.0
                 else:
                     no_chapter_count += 1
                 if no_chapter_count <= 3:
@@ -2777,16 +2777,19 @@ class EClassApp:
             self.cycle_count += 1
             self._set_status(f"上課中... 第 {self.cycle_count} 次循環")
 
-            # v1.8.31:每 30 秒印一次精準狀態(取代每 cycle「第N次」噪訊)
+            # v1.8.31/33:每 30 秒印一次精準狀態(取代每 cycle「第N次」噪訊),含 SCORM 時數驗證
             now_t2 = time.time()
             if (now_t2 - last_status_at) >= 30:
                 last_status_at = now_t2
                 elapsed_min = (now_t2 - start_time) / 60
+                # v1.8.33 B:抓 SCORM API 時數,驗證站方有沒有真的累進
+                scorm = self._detect_scorm_time()
+                scorm_str = f" / SCORM[{scorm[0]}]={scorm[1]}" if scorm else " / SCORM=N/A"
                 if last_advance_at:
                     page_remain = max(0, current_page_dur - (now_t2 - last_advance_at))
-                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,本頁停留中(剩 {page_remain:.0f} 秒)")
+                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,本頁剩 {page_remain:.0f} 秒{scorm_str}")
                 else:
-                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,等待推進...")
+                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,等待推進...{scorm_str}")
 
             if local_cycle % check_every == 0:
                 in_player = "elearn.hrd.gov.tw" in self.driver.current_url
@@ -2858,6 +2861,37 @@ class EClassApp:
         except Exception:
             pass
         return False
+
+    def _detect_scorm_time(self):
+        """v1.8.33:嘗試從 SCORM API 抓 session_time / total_time。
+        SCORM 1.2 (window.API.LMSGetValue) / SCORM 2004 (API_1484_11.GetValue)。
+        回傳 (mode, time_str) 或 None。
+        """
+        js = (
+            "try {"
+            "  var c1 = [window.API, window.parent && window.parent.API, window.top && window.top.API];"
+            "  for (var i=0;i<c1.length;i++){"
+            "    var a=c1[i];"
+            "    if (a && typeof a.LMSGetValue==='function'){"
+            "      var t=a.LMSGetValue('cmi.core.total_time') || a.LMSGetValue('cmi.core.session_time');"
+            "      if (t) return ['scorm12', String(t)];"
+            "    }"
+            "  }"
+            "  var c2 = [window.API_1484_11, window.parent && window.parent.API_1484_11, window.top && window.top.API_1484_11];"
+            "  for (var i=0;i<c2.length;i++){"
+            "    var a=c2[i];"
+            "    if (a && typeof a.GetValue==='function'){"
+            "      var t=a.GetValue('cmi.total_time') || a.GetValue('cmi.session_time');"
+            "      if (t) return ['scorm2004', String(t)];"
+            "    }"
+            "  }"
+            "  return null;"
+            "} catch(e) { return null; }"
+        )
+        try:
+            return self.driver.execute_script(js)
+        except Exception:
+            return None
 
     def _detect_video_duration(self):
         """v1.8.30:偵測當前頁面 <video>.duration (秒)。跨 frame 找;找不到回 None。
