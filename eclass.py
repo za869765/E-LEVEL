@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.28"
+VERSION = "1.8.29"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2639,6 +2639,7 @@ class EClassApp:
         # v1.8.27:dump 邏輯移到 _find_chapters 內(在 frame context 抓 outerHTML 避免 stale)
         self._chapter_found_logged = False
         self._chapter_selectors_probed = False  # v1.8.28:每門課首次探測所有 selector(診斷用)
+        self._pathtree_log_done = False         # v1.8.29:pathtree.nextStep 成功 log 只印一次
         # v1.8.16：進 loop 前先確保在上課頁面（不在的話 _find_chapters 會空轉）
         try:
             if self._try_jump_to_lesson_sysbar():
@@ -2707,24 +2708,28 @@ class EClassApp:
                     self.log(f"已上課 {elapsed_min:.0f} 分鐘，達 target({target_min:g} 分)，切換測驗/問卷")
                     return
 
-            chapters = self._find_chapters()
-            if chapters:
-                # v1.8.27:章節 dump 已在 _find_chapters 內完成(frame context 還在,outerHTML 不會 stale)
-                no_chapter_count = 0
-                for ch in chapters:
-                    if not self.running:
-                        return
-                    try:
-                        self.driver.execute_script("arguments[0].click()", ch)
-                        time.sleep(0.5)
-                    except (StaleElementReferenceException, WebDriverException):
-                        break
-            elif self._try_pathtree_advance():
-                # v1.8.18：衛生福利e學園的 pathtree.nextStep(1) 推進
+            # v1.8.29:優先試 pathtree.nextStep(1)(衛生福利e學園真正推進方式);
+            #          失敗才退化到點 SCO 章節元素(其他平台)
+            #          原因:_find_chapters 在衛生福利e學園抓到的 3 個 SCO 都是 meta(環境檢測/勘誤),
+            #          點它們不會累時數;真章節靠 pathtree.nextStep 推進
+            if self._try_pathtree_advance():
                 no_chapter_count = 0
                 time.sleep(2)
             else:
-                no_chapter_count += 1
+                chapters = self._find_chapters()
+                if chapters:
+                    # v1.8.27:章節 dump 已在 _find_chapters 內完成(frame context 還在,outerHTML 不會 stale)
+                    no_chapter_count = 0
+                    for ch in chapters:
+                        if not self.running:
+                            return
+                        try:
+                            self.driver.execute_script("arguments[0].click()", ch)
+                            time.sleep(0.5)
+                        except (StaleElementReferenceException, WebDriverException):
+                            break
+                else:
+                    no_chapter_count += 1
                 if no_chapter_count <= 3:
                     self.log("找不到課程章節，等待中...")
                     time.sleep(10)
@@ -2807,7 +2812,10 @@ class EClassApp:
                     # 推進到下一節點
                     self.driver.execute_script("pathtree.nextStep(1);")
                     self.driver.switch_to.default_content()
-                    self.log("→ pathtree.nextStep(1) 已推進章節")
+                    # v1.8.29:每門課首次成功才 log,後續 cycle 沉默
+                    if not getattr(self, '_pathtree_log_done', False):
+                        self._pathtree_log_done = True
+                        self.log("→ pathtree.nextStep(1) 推進章節中(後續 cycle 沉默)")
                     return True
                 except Exception:
                     continue
