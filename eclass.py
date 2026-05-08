@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.24"
+VERSION = "1.8.25"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2258,18 +2258,23 @@ class EClassApp:
             if req:
                 self.log(f"時數門檻：需上課至少 {req} 分鐘（總時數 50%）")
 
-            # v1.8.24：嘗試解析「已上時數」— 移除「閱讀」前綴(會誤匹配「閱讀時數」門檻字串)
-            #         必須有「已上/目前/累計/本次/現有」等明確「已完成」語意的前綴
+            # v1.8.25：實機驗證站方頁面用「閱讀時數:HH:MM:SS」格式(label 本身=已上)
+            #          優先抓 HH:MM:SS;退化才用「已上 X 分」pattern
             already = None
-            for pat in (
-                r'(?:已上|目前|累計|本次|現有)'
-                r'\s*(?:閱讀|上課|學習|課程)?\s*時數\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分',
-                r'(?:已上|目前|累計|本次)\s*(\d+(?:\.\d+)?)\s*分',
-            ):
-                m3 = re.search(pat, body)
-                if m3:
-                    already = float(m3.group(1))
-                    break
+            m_hms = re.search(r'閱讀時數\s*[:：]\s*(\d+):(\d+):(\d+)', body)
+            if m_hms:
+                h, mi, s = int(m_hms.group(1)), int(m_hms.group(2)), int(m_hms.group(3))
+                already = h * 60 + mi + s / 60.0
+            else:
+                for pat in (
+                    r'(?:已上|目前|累計|本次|現有)'
+                    r'\s*(?:閱讀|上課|學習|課程)?\s*時數\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分',
+                    r'(?:已上|目前|累計|本次)\s*(\d+(?:\.\d+)?)\s*分',
+                ):
+                    m3 = re.search(pat, body)
+                    if m3:
+                        already = float(m3.group(1))
+                        break
             if already is not None:
                 self.log(f"✓ 已上時數：{already:g} 分鐘")
                 self._current_already_min = already
@@ -2441,8 +2446,9 @@ class EClassApp:
                     if any(p in name or p in src for p in priority_frame_names):
                         self.driver.switch_to.default_content()
                         self.driver.switch_to.frame(fr)
-                        self.log(f"優先掃對話框 frame: name={name} src={src[:40]}")
+                        # v1.8.25：找到 frame 不等於有彈窗,只在實際關彈窗時才 log
                         if _scan_one_context():
+                            self.log(f"✓ 已關彈窗(對話框 frame: name={name})")
                             return True
                 except Exception:
                     continue
@@ -2629,6 +2635,8 @@ class EClassApp:
         if required_minutes and target_min == 0:
             self.log(f"✓ 時數已達標(已上 {already_minutes:g} ≥ 需 {required_minutes} 分)，跳過上課階段")
             return
+        # v1.8.25:每門課第一次找到章節時 dump 標題,後續 cycle 不再 dump
+        self._chapters_dumped = False
         # v1.8.16：進 loop 前先確保在上課頁面（不在的話 _find_chapters 會空轉）
         try:
             if self._try_jump_to_lesson_sysbar():
@@ -2699,6 +2707,19 @@ class EClassApp:
 
             chapters = self._find_chapters()
             if chapters:
+                # v1.8.25:首次找到章節時 dump 標題(讓 log 看到實際抓到哪些)
+                if not self._chapters_dumped:
+                    self._chapters_dumped = True
+                    self.log(f"📖 章節清單(共 {len(chapters)} 個):")
+                    for i, ch in enumerate(chapters[:20], 1):
+                        try:
+                            t = (ch.get_attribute("title") or ch.text or "").strip()
+                            t = t.replace("\n", " ")[:80]
+                            self.log(f"   [{i}] {t or '(無標題, tag=' + ch.tag_name + ')'}")
+                        except Exception:
+                            pass
+                    if len(chapters) > 20:
+                        self.log(f"   ...(其他 {len(chapters)-20} 個略)")
                 no_chapter_count = 0
                 for ch in chapters:
                     if not self.running:
