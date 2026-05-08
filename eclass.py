@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.30"
+VERSION = "1.8.31"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2657,6 +2657,8 @@ class EClassApp:
         current_page_dur = 30 * 60.0   # default 30 分鐘
         self._video_duration_logged = False
         self._video_default_logged = False
+        # v1.8.31:每 30 秒印一次精準狀態,取代每 cycle「第N次」噪訊
+        last_status_at = 0.0
         # v1.8.22：「閱讀閒置提醒」對話框首次偵測時間戳
         idle_dlg_first_seen = None
         IDLE_DLG_TIMEOUT = 270  # 秒；站方倒數 297 秒，留 27 秒緩衝主動跳考避險
@@ -2774,11 +2776,20 @@ class EClassApp:
 
             local_cycle += 1
             self.cycle_count += 1
-            self.log(f"第{self.cycle_count}次，我正在努力上課中....運行")
             self._set_status(f"上課中... 第 {self.cycle_count} 次循環")
 
+            # v1.8.31:每 30 秒印一次精準狀態(取代每 cycle「第N次」噪訊)
+            now_t2 = time.time()
+            if (now_t2 - last_status_at) >= 30:
+                last_status_at = now_t2
+                elapsed_min = (now_t2 - start_time) / 60
+                if last_advance_at:
+                    page_remain = max(0, current_page_dur - (now_t2 - last_advance_at))
+                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,本頁停留中(剩 {page_remain:.0f} 秒)")
+                else:
+                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,等待推進...")
+
             if local_cycle % check_every == 0:
-                self.log("檢查上課時數...")
                 in_player = "elearn.hrd.gov.tw" in self.driver.current_url
                 if not in_player:
                     try:
