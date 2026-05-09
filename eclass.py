@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.40"
+VERSION = "1.8.41"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2079,7 +2079,13 @@ class EClassApp:
                     self.log("⚡ 進入測驗模式")
                     self._auto_take_exam()
                 else:
-                    self.log("⚠ 無法進入測驗頁,放棄本門測驗")
+                    # v1.8.41:測驗被擋 → 推測站方時數未認可 → 重查並補課再試一次
+                    self.log("⚠ 測驗被擋 → 重查站方時數,不足則補課")
+                    if self._recheck_and_supplement(req_min, label="測驗") and self._try_jump_to_exam_sysbar():
+                        self.log("⚡ 補課後進入測驗模式")
+                        self._auto_take_exam()
+                    else:
+                        self.log("⚠ 補課後仍無法進入測驗頁,放棄本門測驗")
             else:
                 self.log("【B】badges 明確不需測驗,跳過")
 
@@ -2091,7 +2097,13 @@ class EClassApp:
                         self.log("⚡ 進入問卷模式")
                         self._auto_fill_player_survey()
                     else:
-                        self.log("⚠ 無法進入問卷頁,放棄本門問卷")
+                        # v1.8.41:問卷被擋(常因「請先閱讀達應閱讀時數」)→ 重查並補課再試
+                        self.log("⚠ 問卷被擋 → 重查站方時數,不足則補課")
+                        if self._recheck_and_supplement(req_min, label="問卷") and self._try_jump_to_survey_sysbar():
+                            self.log("⚡ 補課後進入問卷模式")
+                            self._auto_fill_player_survey()
+                        else:
+                            self.log("⚠ 補課後仍無法進入問卷頁,放棄本門問卷")
                 except Exception as _e:
                     self.log(f"問卷處理錯誤: {_e}")
             elif ns is None:
@@ -2647,6 +2659,39 @@ class EClassApp:
         """v1.8.16：點左側「開始上課」回到上課播放器（修「測驗/問卷後沒回上課」）"""
         return self._try_jump_to_sysbar_link(
             ["開始上課", "lesson", "play"], "開始上課")
+
+    def _recheck_and_supplement(self, req_min, label="測驗"):
+        """v1.8.41：階段 B/C 被擋（測驗按鈕沒出現/問卷頁顯示閱讀時數不足）時呼叫。
+        切回上課頁 → 重抓站方「閱讀時數」→ 仍短缺則回呼 _learning_loop 補課。
+        回傳 True 代表完成補課（或重查後已達標），False 代表無法補（req_min 未知/切頁失敗）。
+        重試保護由 _learning_loop 自身的站方達標退出 + 90 分鐘上限承擔，不會無窮迴圈。
+        """
+        if not req_min:
+            self.log("⚠ req_min 未知,無法重查補課")
+            return False
+        # 切回上課頁（補課需要 player context）
+        try:
+            if not self._try_jump_to_lesson_sysbar():
+                self.log("⚠ 切回「開始上課」失敗,無法補課")
+                return False
+        except Exception as e:
+            self.log(f"⚠ 切回上課頁錯誤: {e}")
+            return False
+        self._human_sleep(2.0, 0.5)
+        # 重抓站方時數;抓不到就以最後已知值為起點
+        new_already = self._extract_already_from_current()
+        if new_already is None:
+            new_already = self._current_already_min or 0
+            self.log(f"⚠ 站方時數抓不到,以最後已知 {new_already*60:.0f} 秒為起點補課（{label} 被擋）")
+        else:
+            self._current_already_min = new_already
+        if new_already >= req_min:
+            self.log(f"✓ 重查站方時數已達標({new_already*60:.0f}/{req_min*60:.0f} 秒,{label} 仍被擋可能是 DOM 未同步)")
+            return True
+        shortage_sec = (req_min - new_already) * 60
+        self.log(f"📋 {label} 被擋 → 站方時數 {new_already*60:.0f}/{req_min*60:.0f} 秒,缺 {shortage_sec:.0f} 秒 → 回上課頁補課")
+        self._learning_loop(required_minutes=req_min, already_minutes=new_already)
+        return True
 
     def _learning_loop(self, required_minutes=0, already_minutes=0):
         """v1.8.23：accept already_minutes 起點，目標 = max(0, required - already)。
