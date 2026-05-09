@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.40"
+VERSION = "1.8.42"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2079,7 +2079,11 @@ class EClassApp:
                     self.log("⚡ 進入測驗模式")
                     self._auto_take_exam()
                 else:
-                    self.log("⚠ 無法進入測驗頁,放棄本門測驗")
+                    # v1.8.42:測驗被擋 → 補課重試(最多 3 精算+1×1800 兜底,永不放棄)
+                    self.log("⚠ 測驗被擋 → 啟動補課重試(永不放棄本門)")
+                    if self._recheck_and_supplement(req_min, self._try_jump_to_exam_sysbar, label="測驗"):
+                        self.log("⚡ 進入測驗模式(補課後)")
+                        self._auto_take_exam()
             else:
                 self.log("【B】badges 明確不需測驗,跳過")
 
@@ -2091,7 +2095,11 @@ class EClassApp:
                         self.log("⚡ 進入問卷模式")
                         self._auto_fill_player_survey()
                     else:
-                        self.log("⚠ 無法進入問卷頁,放棄本門問卷")
+                        # v1.8.42:問卷被擋(常因「請先閱讀達應閱讀時數」)→ 補課重試
+                        self.log("⚠ 問卷被擋 → 啟動補課重試(永不放棄本門)")
+                        if self._recheck_and_supplement(req_min, self._try_jump_to_survey_sysbar, label="問卷"):
+                            self.log("⚡ 進入問卷模式(補課後)")
+                            self._auto_fill_player_survey()
                 except Exception as _e:
                     self.log(f"問卷處理錯誤: {_e}")
             elif ns is None:
@@ -2647,6 +2655,76 @@ class EClassApp:
         """v1.8.16：點左側「開始上課」回到上課播放器（修「測驗/問卷後沒回上課」）"""
         return self._try_jump_to_sysbar_link(
             ["開始上課", "lesson", "play"], "開始上課")
+
+    def _recheck_and_supplement(self, req_min, retry_jump_fn, label="測驗"):
+        """v1.8.42:測驗/問卷被擋時補課重試,**永不放棄本門課**。
+
+        最多 4 輪:前 3 輪精算補課秒數,第 4 輪 1800 秒兜底。
+        每輪流程:切回上課頁 → 重抓站方時數 → 算補課秒數 → 跑 _learning_loop → 重試跳測驗/問卷。
+
+        補課秒數三層判斷(由準到粗):
+          1. 抓到站方 already → max(60, (req - already) × 60)
+          2. 抓不到但有 _current_already_min + req_min → max(60, (req - 已知) × 60 + 60 安全)
+          3. 完全無法判斷 / 第 4 輪兜底 → 1800 秒
+
+        retry_jump_fn:傳 self._try_jump_to_exam_sysbar 或 self._try_jump_to_survey_sysbar
+        回傳 True=最終跳成,False=4 輪皆失敗(本門記為跑失敗,但外層流程繼續)
+        """
+        MAX_RETRY = 4
+        FALLBACK_SEC = 1800
+
+        for attempt in range(MAX_RETRY):
+            tag = f"第 {attempt+1}/{MAX_RETRY} 輪"
+            # 切回上課頁
+            try:
+                if not self._try_jump_to_lesson_sysbar():
+                    self.log(f"⚠ {tag} 切回上課頁失敗,跳過本輪")
+                    continue
+            except Exception as e:
+                self.log(f"⚠ {tag} 切回上課頁錯誤: {e}")
+                continue
+            self._human_sleep(2.0, 0.5)
+
+            # 計算補課秒數
+            new_already = self._extract_already_from_current()
+            sup_sec = None
+            if new_already is not None:
+                self._current_already_min = new_already
+                if req_min and new_already >= req_min:
+                    self.log(f"✓ {tag} 站方時數已達標({new_already*60:.0f}/{req_min*60:.0f} 秒) → 直接重試 {label}")
+                    if retry_jump_fn():
+                        self.log(f"⚡ {tag} {label} 跳成功(站方已達標)")
+                        return True
+                    self.log(f"⚠ {tag} 站方達標但 {label} 仍被擋(DOM 未同步?)→ 進下一輪")
+                    continue
+                if req_min:
+                    sup_sec = max(60, int((req_min - new_already) * 60))
+                    self.log(f"📋 {tag} 站方 {new_already*60:.0f}/{req_min*60:.0f} 秒,補 {sup_sec} 秒")
+            if sup_sec is None and req_min and self._current_already_min is not None:
+                sup_sec = max(60, int((req_min - self._current_already_min) * 60 + 60))
+                self.log(f"⚠ {tag} 站方時數抓不到,以已知 {self._current_already_min*60:.0f} 秒+60 安全係數 → 補 {sup_sec} 秒")
+            # 完全無法判斷 OR 已是最後一輪 → 1800 秒兜底
+            if sup_sec is None or attempt == MAX_RETRY - 1:
+                if sup_sec is None:
+                    self.log(f"🛟 {tag} 完全無法判斷還要上多久 → 1800 秒兜底再試 {label}")
+                else:
+                    self.log(f"🛟 {tag} 已用完 3 次精算補課,改 1800 秒兜底再試 {label}")
+                sup_sec = FALLBACK_SEC
+
+            # 補課:呼 _learning_loop,fake required = current + sup_min
+            sup_min = max(1, int(round(sup_sec / 60.0)))
+            cur = self._current_already_min or 0
+            fake_required = cur + sup_min
+            self._learning_loop(required_minutes=fake_required, already_minutes=cur)
+
+            # 補完試跳測驗/問卷
+            if retry_jump_fn():
+                self.log(f"⚡ {tag} 補課後 {label} 跳成功")
+                return True
+            self.log(f"⚠ {tag} 補課後 {label} 仍被擋")
+
+        self.log(f"⚠ {label} 重試 {MAX_RETRY} 輪皆失敗,本門當作跑失敗(流程繼續下一門)")
+        return False
 
     def _learning_loop(self, required_minutes=0, already_minutes=0):
         """v1.8.23：accept already_minutes 起點，目標 = max(0, required - already)。
