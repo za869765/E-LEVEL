@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.38"
+VERSION = "1.8.39"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2246,25 +2246,38 @@ class EClassApp:
                     self.log(f"📋 {line}")
                     seen.add(line)
 
-            # 解析時數門檻（50%）
-            m = re.search(r'(\d+(?:\.\d+)?)\s*小時', body)
-            if m:
-                req = int(float(m.group(1)) * 60 * 0.5)
+            # v1.8.39:時數門檻優先抓「通過條件」中的「閱讀時數:HH:MM:SS(含)以上」(真實門檻)
+            #          fallback 才用「總時數 50%」(以前的錯誤推估)
+            req_from_pass = None
+            m_pass = re.search(r'閱讀時數\s*[:：]?\s*(\d+):(\d+):(\d+)\s*[(（][^)）]*[)）]\s*以上', body)
+            if m_pass:
+                h, mi, s = int(m_pass.group(1)), int(m_pass.group(2)), int(m_pass.group(3))
+                req_from_pass = int(h * 60 + mi + s / 60.0)
+            if req_from_pass:
+                req = req_from_pass
+                self.log(f"時數門檻：通過條件規定至少 {req*60} 秒(權威來源)")
             else:
-                m2 = re.search(r'(\d+)\s*分鐘', body)
-                if m2:
-                    req = int(int(m2.group(1)) * 0.5)
-            if req:
-                self.log(f"時數門檻：需上課至少 {req*60} 秒（總時數 50%）")
+                # fallback 50% 推估
+                m = re.search(r'(\d+(?:\.\d+)?)\s*小時', body)
+                if m:
+                    req = int(float(m.group(1)) * 60 * 0.5)
+                else:
+                    m2 = re.search(r'(\d+)\s*分鐘', body)
+                    if m2:
+                        req = int(int(m2.group(1)) * 0.5)
+                if req:
+                    self.log(f"時數門檻：需上課至少 {req*60} 秒（總時數 50%,推估值）")
 
-            # v1.8.25：實機驗證站方頁面用「閱讀時數:HH:MM:SS」格式(label 本身=已上)
-            #          優先抓 HH:MM:SS;退化才用「已上 X 分」pattern
+            # v1.8.25/39:抓「已上時數」 — 排除「(含)以上」(那是門檻不是已上)
             already = None
-            m_hms = re.search(r'閱讀時數\s*[:：]\s*(\d+):(\d+):(\d+)', body)
-            if m_hms:
+            for m_hms in re.finditer(r'閱讀時數\s*[:：]\s*(\d+):(\d+):(\d+)([^\n]{0,15})', body):
+                rest = m_hms.group(4) or ""
+                if "以上" in rest:
+                    continue   # 這是門檻字串,跳過
                 h, mi, s = int(m_hms.group(1)), int(m_hms.group(2)), int(m_hms.group(3))
                 already = h * 60 + mi + s / 60.0
-            else:
+                break
+            if already is None:
                 for pat in (
                     r'(?:已上|目前|累計|本次|現有)'
                     r'\s*(?:閱讀|上課|學習|課程)?\s*時數\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分',
@@ -2913,7 +2926,8 @@ class EClassApp:
             return None
 
     def _extract_already_from_current(self):
-        """v1.8.36:從當前 driver context 任一 frame 找「閱讀時數:HH:MM:SS」字串並換算分鐘。
+        """v1.8.36/39:從當前 driver context 任一 frame 找「閱讀時數:HH:MM:SS」(已上時數)。
+        v1.8.39:排除「(含)以上」尾綴(那是通過條件門檻,不是已上時數)。
         用於 _learning_loop 中途檢查站方實際時數,取代 _can_take_exam_now() 按鈕 proxy。
         找不到回 None。
         """
@@ -2921,8 +2935,13 @@ class EClassApp:
             "function f(d){"
             "  try {"
             "    var t=(d.body && d.body.innerText) || '';"
-            "    var m=t.match(/閱讀時數\\s*[:：]\\s*(\\d+):(\\d+):(\\d+)/);"
-            "    if (m) return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])];"
+            "    var re=/閱讀時數\\s*[:：]\\s*(\\d+):(\\d+):(\\d+)([^\\n]{0,15})/g;"
+            "    var m;"
+            "    while ((m=re.exec(t))!==null) {"
+            "      if ((m[4]||'').indexOf('以上')<0) {"
+            "        return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])];"
+            "      }"
+            "    }"
             "  } catch(e) {}"
             "  return null;"
             "}"
