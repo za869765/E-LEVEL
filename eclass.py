@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.36"
+VERSION = "1.8.37"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2661,9 +2661,14 @@ class EClassApp:
         # v1.8.22：「閱讀閒置提醒」對話框首次偵測時間戳
         idle_dlg_first_seen = None
         IDLE_DLG_TIMEOUT = 270  # 秒；站方倒數 297 秒，留 27 秒緩衝主動跳考避險
-        # v1.8.36:每 5 分鐘從當前頁面重抓「閱讀時數」對比 req_min(取代 _can_take_exam_now 30 分檢查)
+        # v1.8.36/37:站方時數權威 + _can_take_exam_now() 兜底
+        # - 5 分鐘抓「閱讀時數」對比 req_min;抓到 → 信任站方
+        # - 抓不到才 fallback:30 分鐘嘗試 _can_take_exam_now() 偵測測驗鈕(v1.8.20 原邏輯)
         last_already_check = time.time()
-        ALREADY_CHECK_INTERVAL = 5 * 60  # 秒
+        last_exam_check = time.time()
+        ALREADY_CHECK_INTERVAL = 5 * 60   # 秒
+        EXAM_CHECK_INTERVAL = 30 * 60     # 秒
+        already_ever_detected = False
 
         while self.running:
             # ── 每次循環優先處理驗證彈窗（30分鐘一次，不處理會被登出）──
@@ -2695,18 +2700,29 @@ class EClassApp:
             else:
                 idle_dlg_first_seen = None
 
-            # v1.8.36:每 5 分鐘從當前頁面重抓「閱讀時數」對比 req_min(站方權威時數,取代按鈕 proxy)
+            # v1.8.36:每 5 分鐘從當前頁面重抓「閱讀時數」對比 req_min(站方權威)
             if time.time() - last_already_check >= ALREADY_CHECK_INTERVAL:
                 last_already_check = time.time()
                 new_already = self._extract_already_from_current()
-                if new_already is not None and new_already > already_minutes:
-                    delta = new_already - already_minutes
-                    self.log(f"📋 站方時數更新:{already_minutes:.2f} → {new_already:.2f} 分(漲 {delta:.2f})")
-                    already_minutes = new_already
-                    target_min = max(0, required_minutes - already_minutes)
-                    if target_min == 0:
-                        self.log(f"✓ 站方時數已達標({already_minutes:.2f} ≥ {required_minutes}),退出去測驗")
-                        return
+                if new_already is not None:
+                    already_ever_detected = True
+                    if new_already > already_minutes:
+                        delta = new_already - already_minutes
+                        self.log(f"📋 站方時數更新:{already_minutes:.2f} → {new_already:.2f} 分(漲 {delta:.2f})")
+                        already_minutes = new_already
+                        target_min = max(0, required_minutes - already_minutes)
+                        if target_min == 0:
+                            self.log(f"✓ 站方時數已達標({already_minutes:.2f} ≥ {required_minutes}),退出去測驗")
+                            return
+
+            # v1.8.37:fallback — 站方時數抓不到時,每 30 分鐘嘗試 _can_take_exam_now()
+            if (not already_ever_detected and
+                    time.time() - last_exam_check >= EXAM_CHECK_INTERVAL):
+                last_exam_check = time.time()
+                if self._can_take_exam_now():
+                    elapsed_min = (time.time() - start_time) / 60
+                    self.log(f"⚡ 上課 {elapsed_min:.0f} 分後偵測到「進行測驗」可點(站方時數抓不到時的 fallback)")
+                    return
 
             # ── 時數門檻:wall time 兜底(站方時數抓不到時用) ──
             if target_min > 0:
