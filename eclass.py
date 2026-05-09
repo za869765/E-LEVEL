@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.46"
+VERSION = "1.8.48"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -367,6 +367,8 @@ class EClassApp:
         self._prefetch_status = {}        # normalized_title -> 'queued'|'fetching'|'done'|'miss'|'err'
         self._prefetch_events = {}        # normalized_title -> threading.Event()
         self._prefetch_lock   = threading.Lock()
+        # v1.8.48:config 寫入鎖(避免 worker + main thread 同時 _save_config 互踩)
+        self._cfg_lock = threading.Lock()
         self._prefetch_thread = None
         self._prefetch_index  = None
         self._init_gemini()   # v1.8.8
@@ -393,20 +395,31 @@ class EClassApp:
 
     def _save_config(self):
         # v1.8.8：保留所有未列舉欄位（如 gemini_api_key）避免被覆蓋
-        cfg = dict(self.config)
-        cfg["accounts"]     = self.config.get("accounts", [])
-        cfg["last_account"] = self.account_var.get()
-        cfg["browser"]      = self.browser_type.get()
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        # v1.8.48:加 _cfg_lock 避免 worker + main thread 並發互踩
+        # 注意:本 method 應從 main thread 呼叫(會讀 Tkinter StringVar);
+        # worker thread 改用 self.root.after_idle(self._save_config) 排到 main
+        with self._cfg_lock:
+            cfg = dict(self.config)
+            cfg["accounts"]     = self.config.get("accounts", [])
+            try:
+                cfg["last_account"] = self.account_var.get()
+                cfg["browser"]      = self.browser_type.get()
+            except Exception:
+                # 萬一在 worker thread 被誤呼(_init_gemini 階段),不讓 StringVar
+                # 存取例外打斷寫入 — 用 config 既有值兜底
+                cfg["last_account"] = self.config.get("last_account", "")
+                cfg["browser"]      = self.config.get("browser", "edge")
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     # ── v1.8.8: Gemini AI (直連 REST API，零 SDK) ────────────
 
     def _init_gemini(self):
-        # v1.8.45:支援多筆 key 主備 fallback。
-        # 優先讀 gemini_api_keys: [{label, key}, ...] (按優先序)
+        # v1.8.45:支援多筆 key 主備 fallback;v1.8.47:加 stats_id per-key 累積
+        # 優先讀 gemini_api_keys: [{label, key, stats_id}, ...]
         # 沒設則 fallback 舊 gemini_api_key 欄位(視為單把「主」)
-        self._gemini_keys = []   # list[{label, key}]
+        import uuid
+        self._gemini_keys = []
         self._gemini_key_idx = 0
         ks = self.config.get("gemini_api_keys")
         if isinstance(ks, list):
@@ -414,22 +427,82 @@ class EClassApp:
                 if isinstance(item, dict):
                     k = (item.get("key") or "").strip()
                     if k:
+                        # v1.8.47:沒 stats_id 就生成,寫回 config
+                        sid = item.get("stats_id") or uuid.uuid4().hex[:12]
+                        item["stats_id"] = sid
                         self._gemini_keys.append({
                             "label": item.get("label") or f"key{i+1}",
                             "key": k,
+                            "stats_id": sid,
                         })
         # 向後相容:舊 gemini_api_key 視為「主」(若未已包含於 keys 列)
         legacy = (self.config.get("gemini_api_key") or "").strip()
         if legacy and not any(k["key"] == legacy for k in self._gemini_keys):
-            self._gemini_keys.insert(0, {"label": "主(legacy)", "key": legacy})
+            self._gemini_keys.insert(0, {
+                "label": "主(legacy)",
+                "key": legacy,
+                "stats_id": uuid.uuid4().hex[:12],
+            })
+        # 把 stats_id 同步寫回 config(讓下次啟動穩定)
+        self.config["gemini_api_keys"] = [
+            {"label": k["label"], "key": k["key"], "stats_id": k["stats_id"]}
+            for k in self._gemini_keys
+        ]
+        # v1.8.48:legacy gemini_api_key 已遷移到 gemini_api_keys list
+        # → pop 掉避免使用者刪 key 後又被舊欄位重生
+        self.config.pop("gemini_api_key", None)
         # 設目前生效 key
         self._gemini = self._gemini_keys[0]["key"] if self._gemini_keys else None
+        # 確保 gemini_stats 容器存在(per-key 累積)
+        self.config.setdefault("gemini_stats", {})
         # v1.8.13: RPM 節流 + 連續 429 計數
         self._gemini_last_call = 0.0
         self._gemini_429_streak = 0
 
+    def _current_gemini_stats_id(self):
+        """v1.8.47:取目前生效 key 的 stats_id;沒有 key 回 None"""
+        if not self._gemini_keys or self._gemini_key_idx >= len(self._gemini_keys):
+            return None
+        return self._gemini_keys[self._gemini_key_idx].get("stats_id")
+
+    def _update_gemini_persistent_stats(self, in_t, out_t):
+        """v1.8.47:把單次呼叫的 token 用量寫到 config.gemini_stats[stats_id]
+        per-key 累積 + by_date 分日。session 累積仍走 self._stats(既有)。
+        """
+        sid = self._current_gemini_stats_id()
+        if not sid:
+            return
+        try:
+            stats_root = self.config.setdefault("gemini_stats", {})
+            entry = stats_root.setdefault(sid, {
+                "calls": 0, "in_tokens": 0, "out_tokens": 0,
+                "first_seen": "", "last_seen": "", "by_date": {},
+            })
+            entry["calls"] = int(entry.get("calls", 0)) + 1
+            entry["in_tokens"] = int(entry.get("in_tokens", 0)) + int(in_t or 0)
+            entry["out_tokens"] = int(entry.get("out_tokens", 0)) + int(out_t or 0)
+            from datetime import date
+            today = date.today().isoformat()
+            if not entry.get("first_seen"):
+                entry["first_seen"] = today
+            entry["last_seen"] = today
+            day_root = entry.setdefault("by_date", {}).setdefault(today, {
+                "calls": 0, "in_tokens": 0, "out_tokens": 0,
+            })
+            day_root["calls"] = int(day_root.get("calls", 0)) + 1
+            day_root["in_tokens"] = int(day_root.get("in_tokens", 0)) + int(in_t or 0)
+            day_root["out_tokens"] = int(day_root.get("out_tokens", 0)) + int(out_t or 0)
+            # v1.8.48:本 method 從 worker thread 呼叫 → 排到 main thread 寫檔
+            try:
+                self.root.after_idle(self._save_config)
+            except Exception:
+                # root 未建立(極早期)→ 直接 lock-protected save
+                self._save_config()
+        except Exception:
+            pass
+
     def _switch_gemini_key(self, reason=""):
-        """v1.8.45:切換到下一把備用 key,回傳是否切成。"""
+        """v1.8.45:切換到下一把備用 key,回傳是否切成;v1.8.47:同步 UI Combobox。"""
         if not self._gemini_keys:
             return False
         if self._gemini_key_idx + 1 >= len(self._gemini_keys):
@@ -442,6 +515,22 @@ class EClassApp:
         self._gemini = nk["key"]
         self._gemini_429_streak = 0   # 切到新 key 重設計數
         self.log(f"🔄 Gemini「{old_label}」失效{('(' + reason + ')') if reason else ''} → 切到「{nk['label']}」")
+        # v1.8.47:UI 同步(主執行緒)
+        try:
+            new_idx = self._gemini_key_idx
+            def _ui_sync():
+                try:
+                    if hasattr(self, "gemini_key_selector"):
+                        self.gemini_key_selector.current(new_idx)
+                except Exception:
+                    pass
+                try:
+                    self._update_ai_stats()
+                except Exception:
+                    pass
+            self.root.after_idle(_ui_sync)
+        except Exception:
+            pass
         return True
 
     def _gemini_call(self, prompt, timeout=15):
@@ -468,9 +557,16 @@ class EClassApp:
                     data = json.loads(resp.read().decode("utf-8"))
                 # v1.8.20: 從 usageMetadata 抓 token 用量並更新 UI
                 usage = data.get("usageMetadata") or {}
-                self._stats["prompt_tokens"]     += int(usage.get("promptTokenCount") or 0)
-                self._stats["completion_tokens"] += int(usage.get("candidatesTokenCount") or 0)
+                in_t  = int(usage.get("promptTokenCount") or 0)
+                out_t = int(usage.get("candidatesTokenCount") or 0)
+                self._stats["prompt_tokens"]     += in_t
+                self._stats["completion_tokens"] += out_t
                 self._stats["ai_calls_total"]    += 1
+                # v1.8.47:per-key 持久累積(寫 config.gemini_stats[stats_id])
+                try:
+                    self._update_gemini_persistent_stats(in_t, out_t)
+                except Exception:
+                    pass
                 try:
                     self._update_ai_stats()
                 except Exception:
@@ -625,11 +721,33 @@ class EClassApp:
                                     style="Big.TButton", command=self._on_stop)
         self._set_btn_layout("pre_login")  # 初始狀態
 
-        # ── AI Token 用量量表（v1.8.20） ──
+        # ── AI Token 用量量表（v1.8.20）+ Gemini Key 管理 (v1.8.47) ──
         ai_frame = ttk.LabelFrame(main, text="🤖 AI Token 使用量", padding=6)
         ai_frame.pack(fill=tk.X, pady=(0, 6))
 
-        self.ai_stats_var = tk.StringVar(value="呼叫 0 次　｜　輸入 0　｜　輸出 0 tokens")
+        # v1.8.47:Gemini Key 管理(仿帳號管理 UI)
+        gk_row = ttk.Frame(ai_frame)
+        gk_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(gk_row, text="Gemini Key：", font=("Microsoft JhengHei", 9)
+                  ).pack(side=tk.LEFT)
+        self.gemini_key_selector = ttk.Combobox(gk_row, state="readonly", width=24)
+        self.gemini_key_selector.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 6))
+        self.gemini_key_selector.bind("<<ComboboxSelected>>", self._on_gemini_key_select)
+        ttk.Button(gk_row, text="＋", width=3, command=self._add_gemini_key).pack(side=tk.LEFT, padx=1)
+        ttk.Button(gk_row, text="✎", width=3, command=self._edit_gemini_key).pack(side=tk.LEFT, padx=1)
+        ttk.Button(gk_row, text="✕", width=3, command=self._del_gemini_key).pack(side=tk.LEFT, padx=1)
+
+        # 分隔線
+        ttk.Separator(ai_frame, orient="horizontal").pack(fill=tk.X, pady=(2, 4))
+
+        # 該 key 累積(v1.8.47)
+        self.ai_persist_var = tk.StringVar(value="該 key 累積：尚未呼叫")
+        ttk.Label(ai_frame, textvariable=self.ai_persist_var,
+                  foreground="#1565C0",
+                  font=("Microsoft JhengHei", 9)).pack(anchor="w")
+
+        # 本 session
+        self.ai_stats_var = tk.StringVar(value="本 session：呼叫 0 次　｜　輸入 0　｜　輸出 0 tokens")
         ttk.Label(ai_frame, textvariable=self.ai_stats_var,
                   font=("Microsoft JhengHei", 9)).pack(anchor="w")
 
@@ -642,9 +760,9 @@ class EClassApp:
         ai_bar_row.pack(fill=tk.X, pady=(4, 0))
         self.ai_progress = ttk.Progressbar(ai_bar_row, maximum=GEMINI_FREE_RPD, length=300)
         self.ai_progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.ai_quota_var = tk.StringVar(value=f"0 / {GEMINI_FREE_RPD} 次")
+        self.ai_quota_var = tk.StringVar(value=f"0 / {GEMINI_FREE_RPD} 次（該 key 今日）")
         ttk.Label(ai_bar_row, textvariable=self.ai_quota_var,
-                  foreground="gray", width=14, anchor="e").pack(side=tk.LEFT, padx=(6, 0))
+                  foreground="gray", width=22, anchor="e").pack(side=tk.LEFT, padx=(6, 0))
 
         # ── 狀態 ──
         self.status_var = tk.StringVar(value="就緒")
@@ -665,6 +783,8 @@ class EClassApp:
 
         # ── 初始化帳號列表 ──
         self._refresh_account_list()
+        # v1.8.47:初始化 Gemini Key 列表
+        self._refresh_gemini_key_list()
 
     # ── 按鈕狀態管理 ─────────────────────────────────────
 
@@ -813,6 +933,118 @@ class EClassApp:
             self._save_config()
             self._refresh_account_list()
 
+    # ── Gemini Key 管理 (v1.8.47) ────────────────────────────
+
+    @staticmethod
+    def _mask_api_key(k):
+        """v1.8.47:遮罩顯示 key — 前 4 + ... + 後 4 (不夠就全遮)"""
+        if not k:
+            return ""
+        if len(k) <= 8:
+            return "•" * len(k)
+        return f"{k[:4]}...{k[-4:]}"
+
+    def _refresh_gemini_key_list(self):
+        """v1.8.47:重整 key Combobox + 套用 self._gemini_key_idx 對應 key"""
+        keys = self._gemini_keys
+        names = [f"{k['label']} ({self._mask_api_key(k['key'])})" for k in keys]
+        if hasattr(self, "gemini_key_selector"):
+            self.gemini_key_selector["values"] = names
+            if keys:
+                idx = max(0, min(self._gemini_key_idx, len(keys) - 1))
+                self._gemini_key_idx = idx
+                self.gemini_key_selector.current(idx)
+                self._gemini = keys[idx]["key"]
+            else:
+                self.gemini_key_selector.set("")
+                self._gemini = None
+        try:
+            self._update_ai_stats()
+        except Exception:
+            pass
+
+    def _on_gemini_key_select(self, _=None):
+        """v1.8.47:UI 切換 key"""
+        idx = self.gemini_key_selector.current()
+        if 0 <= idx < len(self._gemini_keys):
+            self._gemini_key_idx = idx
+            self._gemini = self._gemini_keys[idx]["key"]
+            self._gemini_429_streak = 0
+            self.log(f"🔄 已切換 Gemini key 為「{self._gemini_keys[idx]['label']}」")
+        try:
+            self._update_ai_stats()
+        except Exception:
+            pass
+
+    def _add_gemini_key(self):
+        dlg = ApiKeyDialog(self.root, title="新增 Gemini Key")
+        if not dlg.result:
+            return
+        import uuid
+        sid = uuid.uuid4().hex[:12]
+        new_entry = {"label": dlg.result["label"], "key": dlg.result["key"], "stats_id": sid}
+        self._gemini_keys.append(new_entry)
+        self.config["gemini_api_keys"] = [
+            {"label": k["label"], "key": k["key"], "stats_id": k["stats_id"]}
+            for k in self._gemini_keys
+        ]
+        self._save_config()
+        self._refresh_gemini_key_list()
+        self.log(f"✓ 新增 Gemini key「{new_entry['label']}」")
+
+    def _edit_gemini_key(self):
+        idx = self.gemini_key_selector.current()
+        if idx < 0 or idx >= len(self._gemini_keys):
+            return
+        cur = self._gemini_keys[idx]
+        dlg = ApiKeyDialog(self.root, title="編輯 Gemini Key",
+                           data={"label": cur["label"], "key": cur["key"]})
+        if not dlg.result:
+            return
+        # 保留 stats_id 不變(改名/改 key 不影響該 key 的累積)
+        cur["label"] = dlg.result["label"]
+        cur["key"]   = dlg.result["key"]
+        self.config["gemini_api_keys"] = [
+            {"label": k["label"], "key": k["key"], "stats_id": k["stats_id"]}
+            for k in self._gemini_keys
+        ]
+        self._save_config()
+        self._refresh_gemini_key_list()
+        self.log(f"✓ 編輯 Gemini key「{cur['label']}」(stats 累積保留)")
+
+    def _del_gemini_key(self):
+        idx = self.gemini_key_selector.current()
+        if idx < 0 or idx >= len(self._gemini_keys):
+            return
+        cur = self._gemini_keys[idx]
+        if not messagebox.askyesno("確認", f"刪除 key「{cur['label']}」?\n(該 key 累積 stats 也會一併移除)"):
+            return
+        sid = cur.get("stats_id")
+        # v1.8.48:索引調整防止 active 漂移
+        was_active = (idx == self._gemini_key_idx)
+        self._gemini_keys.pop(idx)
+        if was_active:
+            # 刪到當前生效的 → 退到 idx 0(若還有 key)
+            self._gemini_key_idx = 0 if self._gemini_keys else 0
+        elif idx < self._gemini_key_idx:
+            # 刪除位於 active 之前 → active 索引要 -1 才指到原本那把
+            self._gemini_key_idx -= 1
+        # 邊界保護(理論上前面已涵蓋,雙保險)
+        if self._gemini_key_idx >= len(self._gemini_keys):
+            self._gemini_key_idx = max(0, len(self._gemini_keys) - 1)
+        if sid:
+            self.config.get("gemini_stats", {}).pop(sid, None)
+        self.config["gemini_api_keys"] = [
+            {"label": k["label"], "key": k["key"], "stats_id": k["stats_id"]}
+            for k in self._gemini_keys
+        ]
+        self._save_config()
+        self._refresh_gemini_key_list()
+        if was_active and self._gemini_keys:
+            self.log(f"✓ 已刪除 Gemini key「{cur['label']}」(原為當前生效,改用「{self._gemini_keys[0]['label']}」)")
+        else:
+            self.log(f"✓ 已刪除 Gemini key「{cur['label']}」")
+
     # ── 日誌 ──────────────────────────────────────────────
 
     def log(self, msg):
@@ -824,22 +1056,53 @@ class EClassApp:
         self.status_var.set(text)
 
     # v1.8.20: AI Token 用量顯示（worker thread 呼叫，透過 after_idle 切回主執行緒）
+    # v1.8.47:加「該 key 累積」+ progress bar 顯示該 key 今日
     def _update_ai_stats(self):
+        # 本 session
         in_t  = self._stats.get("prompt_tokens", 0)
         out_t = self._stats.get("completion_tokens", 0)
         calls = self._stats.get("ai_calls_total", 0)
         cost  = (in_t * GEMINI_PRICE_IN) + (out_t * GEMINI_PRICE_OUT)
 
+        # v1.8.47:該 key 累積(從 config 讀)
+        sid = self._current_gemini_stats_id() if hasattr(self, "_current_gemini_stats_id") else None
+        persist_text = "該 key 累積：尚未呼叫"
+        today_calls = 0
+        if sid:
+            entry = (self.config.get("gemini_stats") or {}).get(sid)
+            if entry:
+                p_calls = int(entry.get("calls") or 0)
+                p_in    = int(entry.get("in_tokens") or 0)
+                p_out   = int(entry.get("out_tokens") or 0)
+                p_first = entry.get("first_seen") or "—"
+                p_last  = entry.get("last_seen") or "—"
+                persist_text = (f"該 key 累積：呼叫 {p_calls:,}　｜　輸入 {p_in:,}　｜　"
+                                f"輸出 {p_out:,} tokens　({p_first}~{p_last})")
+                # 今日計數(progress bar 用)
+                try:
+                    from datetime import date
+                    today = date.today().isoformat()
+                    today_calls = int(((entry.get("by_date") or {}).get(today) or {}).get("calls") or 0)
+                except Exception:
+                    today_calls = p_calls
+
         def _do():
             try:
+                if hasattr(self, "ai_persist_var"):
+                    self.ai_persist_var.set(persist_text)
                 self.ai_stats_var.set(
-                    f"呼叫 {calls:,} 次　｜　輸入 {in_t:,}　｜　輸出 {out_t:,} tokens"
+                    f"本 session：呼叫 {calls:,} 次　｜　輸入 {in_t:,}　｜　輸出 {out_t:,} tokens"
                 )
                 self.ai_cost_var.set(
                     f"預估費用：${cost:.4f} USD（付費版價格，免費版實際 $0）"
                 )
-                self.ai_progress["value"] = min(calls, GEMINI_FREE_RPD)
-                self.ai_quota_var.set(f"{calls} / {GEMINI_FREE_RPD} 次")
+                # progress bar:該 key 今日(若有 sid),否則退化到本 session
+                bar_val = today_calls if sid else calls
+                self.ai_progress["value"] = min(bar_val, GEMINI_FREE_RPD)
+                self.ai_quota_var.set(
+                    f"{bar_val} / {GEMINI_FREE_RPD} 次（該 key 今日）" if sid
+                    else f"{bar_val} / {GEMINI_FREE_RPD} 次"
+                )
             except Exception:
                 pass
 
@@ -6091,6 +6354,64 @@ class AccountDialog(tk.Toplevel):
             "account":    acc,
             "password":   self.password_var.get(),
             "login_type": self.login_type.get(),
+        }
+        self.destroy()
+
+
+# ══════════════════════════════════════════════════════════
+#  Gemini API Key 新增/編輯對話框 (v1.8.47)
+# ══════════════════════════════════════════════════════════
+
+class ApiKeyDialog(tk.Toplevel):
+    def __init__(self, parent, title="API Key", data=None):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.grab_set()
+        self.result = None
+
+        data = data or {}
+        ttk.Label(self, text="顯示名稱：").grid(row=0, column=0, padx=10, pady=6, sticky="w")
+        self.label_var = tk.StringVar(value=data.get("label", ""))
+        ttk.Entry(self, textvariable=self.label_var, width=30).grid(row=0, column=1, padx=10, pady=6)
+
+        ttk.Label(self, text="API Key：").grid(row=1, column=0, padx=10, pady=6, sticky="w")
+        self.key_var = tk.StringVar(value=data.get("key", ""))
+        kf = ttk.Frame(self)
+        kf.grid(row=1, column=1, padx=10, pady=6, sticky="w")
+        self._key_entry = ttk.Entry(kf, textvariable=self.key_var, show="*", width=26)
+        self._key_entry.pack(side=tk.LEFT)
+        self._key_visible = False
+        self._key_btn = ttk.Button(kf, text="👁", width=3, command=self._toggle_key)
+        self._key_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(self, text="(取得 Gemini API Key:aistudio.google.com/apikey)",
+                  foreground="gray", font=("Microsoft JhengHei", 8)).grid(
+            row=2, column=0, columnspan=2, padx=10, pady=(0, 4), sticky="w")
+
+        bf = ttk.Frame(self)
+        bf.grid(row=3, column=0, columnspan=2, pady=10)
+        ttk.Button(bf, text="確定", command=self._ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="取消", command=self.destroy).pack(side=tk.LEFT)
+
+        self.wait_window()
+
+    def _toggle_key(self):
+        self._key_visible = not self._key_visible
+        self._key_entry.config(show="" if self._key_visible else "*")
+        self._key_btn.config(text="🙈" if self._key_visible else "👁")
+
+    def _ok(self):
+        k = self.key_var.get().strip()
+        if not k:
+            messagebox.showwarning("提示", "API Key 不能為空", parent=self)
+            return
+        if len(k) < 20:
+            messagebox.showwarning("提示", "API Key 長度看起來不對 (應 ≥ 20 字元)", parent=self)
+            return
+        self.result = {
+            "label": self.label_var.get().strip() or "key",
+            "key":   k,
         }
         self.destroy()
 
