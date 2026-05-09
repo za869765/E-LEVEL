@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.34"
+VERSION = "1.8.35"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2777,23 +2777,21 @@ class EClassApp:
             self.cycle_count += 1
             self._set_status(f"上課中... 第 {self.cycle_count} 次循環")
 
-            # v1.8.31/33/34:每 30 秒印一次精準狀態
-            # v1.8.34:只顯示「優先(較小)剩餘秒數」— 累計達標 vs 換頁,誰先到就顯示誰
+            # v1.8.31/33/34/35:每 30 秒印一次精準狀態,只顯示優先(較小)剩餘秒數
+            # v1.8.35:拿掉 SCORM 顯示(此站方一直 N/A,使用者看不懂);_detect_scorm_time 仍保留備用
             now_t2 = time.time()
             if (now_t2 - last_status_at) >= 30:
                 last_status_at = now_t2
                 elapsed_min = (now_t2 - start_time) / 60
-                scorm = self._detect_scorm_time()
-                scorm_str = f" / SCORM[{scorm[0]}]={scorm[1]}" if scorm else ""
                 target_remain_sec = max(0, (target_min - elapsed_min) * 60)
                 if last_advance_at:
                     page_remain_sec = max(0, current_page_dur - (now_t2 - last_advance_at))
                     if target_remain_sec <= page_remain_sec:
-                        self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,目標達標剩 {target_remain_sec:.0f} 秒{scorm_str}")
+                        self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,目標達標剩 {target_remain_sec:.0f} 秒")
                     else:
-                        self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,換頁剩 {page_remain_sec:.0f} 秒{scorm_str}")
+                        self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,換頁剩 {page_remain_sec:.0f} 秒")
                 else:
-                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,等待首次推進...{scorm_str}")
+                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,等待首次推進...")
 
             if local_cycle % check_every == 0:
                 in_player = "elearn.hrd.gov.tw" in self.driver.current_url
