@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.37"
+VERSION = "1.8.38"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2060,7 +2060,7 @@ class EClassApp:
             # ── 階段 A：時數 ──
             if time_short:
                 remaining = req_min - (already or 0)
-                self.log(f"【A】時數短缺(已上 {already or 0:g} / 需 {req_min},剩 {remaining:g} 分)→ 累積時數")
+                self.log(f"【A】時數短缺(已上 {(already or 0)*60:.0f} / 需 {req_min*60} 秒,剩 {remaining*60:.0f} 秒)→ 累積時數")
                 self._learning_loop(required_minutes=req_min, already_minutes=(already or 0))
             else:
                 self.log("【A】時數已達標(或無需閱讀),跳過上課階段")
@@ -2255,7 +2255,7 @@ class EClassApp:
                 if m2:
                     req = int(int(m2.group(1)) * 0.5)
             if req:
-                self.log(f"時數門檻：需上課至少 {req} 分鐘（總時數 50%）")
+                self.log(f"時數門檻：需上課至少 {req*60} 秒（總時數 50%）")
 
             # v1.8.25：實機驗證站方頁面用「閱讀時數:HH:MM:SS」格式(label 本身=已上)
             #          優先抓 HH:MM:SS;退化才用「已上 X 分」pattern
@@ -2275,7 +2275,7 @@ class EClassApp:
                         already = float(m3.group(1))
                         break
             if already is not None:
-                self.log(f"✓ 已上時數：{already:g} 分鐘")
+                self.log(f"✓ 已上時數：{already*60:.0f} 秒")
                 self._current_already_min = already
 
             # v1.8.24：詳情頁補抓分數/及格門檻 — 用 findall 取最後一筆(避免歷史紀錄)
@@ -2632,7 +2632,7 @@ class EClassApp:
         """
         target_min = max(0, required_minutes - already_minutes)
         if required_minutes and target_min == 0:
-            self.log(f"✓ 時數已達標(已上 {already_minutes:g} ≥ 需 {required_minutes} 分)，跳過上課階段")
+            self.log(f"✓ 時數已達標(已上 {already_minutes*60:.0f} ≥ 需 {required_minutes*60:.0f} 秒)，跳過上課階段")
             return
         # v1.8.25/26/27:每門課第一次找到章節時 dump 標題,後續 cycle 不再 dump
         # v1.8.27:dump 邏輯移到 _find_chapters 內(在 frame context 抓 outerHTML 避免 stale)
@@ -2646,7 +2646,7 @@ class EClassApp:
                 self._human_sleep(2.0, 0.5)
         except Exception:
             pass
-        self.log(f"開始上課！請專心聽講......(目標再上 {target_min:g} 分鐘)")
+        self.log(f"開始上課！請專心聽講......(目標再上 {target_min*60:.0f} 秒)")
         check_every = 10   # 每 10 次循環做一次時數確認（內部固定值）
         local_cycle = 0
         no_chapter_count = 0
@@ -2708,11 +2708,11 @@ class EClassApp:
                     already_ever_detected = True
                     if new_already > already_minutes:
                         delta = new_already - already_minutes
-                        self.log(f"📋 站方時數更新:{already_minutes:.2f} → {new_already:.2f} 分(漲 {delta:.2f})")
+                        self.log(f"📋 站方時數更新:{already_minutes*60:.0f} → {new_already*60:.0f} 秒(漲 {delta*60:.0f})")
                         already_minutes = new_already
                         target_min = max(0, required_minutes - already_minutes)
                         if target_min == 0:
-                            self.log(f"✓ 站方時數已達標({already_minutes:.2f} ≥ {required_minutes}),退出去測驗")
+                            self.log(f"✓ 站方時數已達標({already_minutes*60:.0f} ≥ {required_minutes*60:.0f} 秒),退出去測驗")
                             return
 
             # v1.8.37:fallback — 站方時數抓不到時,每 30 分鐘嘗試 _can_take_exam_now()
@@ -2720,15 +2720,15 @@ class EClassApp:
                     time.time() - last_exam_check >= EXAM_CHECK_INTERVAL):
                 last_exam_check = time.time()
                 if self._can_take_exam_now():
-                    elapsed_min = (time.time() - start_time) / 60
-                    self.log(f"⚡ 上課 {elapsed_min:.0f} 分後偵測到「進行測驗」可點(站方時數抓不到時的 fallback)")
+                    elapsed_sec = time.time() - start_time
+                    self.log(f"⚡ 上課 {elapsed_sec:.0f} 秒後偵測到「進行測驗」可點(站方時數抓不到時的 fallback)")
                     return
 
             # ── 時數門檻:wall time 兜底(站方時數抓不到時用) ──
             if target_min > 0:
                 elapsed_min = (time.time() - start_time) / 60
                 if elapsed_min >= target_min:
-                    self.log(f"已上課 {elapsed_min:.0f} 分鐘，達 target({target_min:g} 分)，切換測驗/問卷")
+                    self.log(f"已上 {elapsed_min*60:.0f} 秒，達 target({target_min*60:.0f} 秒)，切換測驗/問卷")
                     return
 
             # v1.8.29/30:優先試 pathtree.nextStep(1),依當前頁面影片時長控制推進頻率
@@ -2794,21 +2794,21 @@ class EClassApp:
             self.cycle_count += 1
             self._set_status(f"上課中... 第 {self.cycle_count} 次循環")
 
-            # v1.8.31/33/34/35:每 30 秒印一次精準狀態,只顯示優先(較小)剩餘秒數
-            # v1.8.35:拿掉 SCORM 顯示(此站方一直 N/A,使用者看不懂);_detect_scorm_time 仍保留備用
+            # v1.8.31/33-38:每 30 秒印一次精準狀態,單位統一用「秒」(避免分/秒混用混淆)
             now_t2 = time.time()
             if (now_t2 - last_status_at) >= 30:
                 last_status_at = now_t2
-                elapsed_min = (now_t2 - start_time) / 60
-                target_remain_sec = max(0, (target_min - elapsed_min) * 60)
+                elapsed_sec = now_t2 - start_time
+                target_sec = target_min * 60
+                target_remain_sec = max(0, target_sec - elapsed_sec)
                 if last_advance_at:
                     page_remain_sec = max(0, current_page_dur - (now_t2 - last_advance_at))
                     if target_remain_sec <= page_remain_sec:
-                        self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,目標達標剩 {target_remain_sec:.0f} 秒")
+                        self.log(f"⏳ 已上 {elapsed_sec:.0f}/{target_sec:.0f} 秒,目標達標剩 {target_remain_sec:.0f} 秒")
                     else:
-                        self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,換頁剩 {page_remain_sec:.0f} 秒")
+                        self.log(f"⏳ 已上 {elapsed_sec:.0f}/{target_sec:.0f} 秒,換頁剩 {page_remain_sec:.0f} 秒")
                 else:
-                    self.log(f"⏳ 累計 {elapsed_min:.1f}/{target_min:g} 分,等待首次推進...")
+                    self.log(f"⏳ 已上 {elapsed_sec:.0f}/{target_sec:.0f} 秒,等待首次推進...")
 
             if local_cycle % check_every == 0:
                 in_player = "elearn.hrd.gov.tw" in self.driver.current_url
