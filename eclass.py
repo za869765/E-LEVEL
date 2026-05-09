@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.48"
+VERSION = "1.8.49"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -3236,24 +3236,25 @@ class EClassApp:
                     last_advance_at = time.time()
                     current_page_dur = 30.0
                 else:
+                    # v1.8.49:章節空才 ++count + log「找不到」,避免找到章節 click 完仍印「找不到」+ sleep 10 浪費
                     no_chapter_count += 1
-                if no_chapter_count <= 3:
-                    self.log("找不到課程章節，等待中...")
-                    time.sleep(10)
-                    continue
-                elif no_chapter_count == 4:
-                    # v1.8.22：章節耗盡 → dump 後立刻嘗試跳測驗（不必空轉等 idle dialog）
-                    self.log("⚠ 連續 3 次找不到章節，dump player HTML...")
-                    self._dump_player_debug()
-                    self.log("章節耗盡，主動嘗試跳測驗頁...")
-                    if self._try_jump_to_exam_sysbar():
-                        self.log("⚡ 章節耗盡跳測驗成功 → 退出 learning_loop")
-                        return
-                    self.log("跳測驗失敗，停留在課程頁面（等待時數累積）...")
-                    time.sleep(60)
-                else:
-                    self.log("停留在課程頁面（等待時數累積）...")
-                    time.sleep(60)
+                    if no_chapter_count <= 3:
+                        self.log("找不到課程章節，等待中...")
+                        time.sleep(10)
+                        continue
+                    elif no_chapter_count == 4:
+                        # v1.8.22：章節耗盡 → dump 後立刻嘗試跳測驗（不必空轉等 idle dialog）
+                        self.log("⚠ 連續 3 次找不到章節，dump player HTML...")
+                        self._dump_player_debug()
+                        self.log("章節耗盡，主動嘗試跳測驗頁...")
+                        if self._try_jump_to_exam_sysbar():
+                            self.log("⚡ 章節耗盡跳測驗成功 → 退出 learning_loop")
+                            return
+                        self.log("跳測驗失敗，停留在課程頁面（等待時數累積）...")
+                        time.sleep(60)
+                    else:
+                        self.log("停留在課程頁面（等待時數累積）...")
+                        time.sleep(60)
 
             local_cycle += 1
             self.cycle_count += 1
@@ -4240,10 +4241,11 @@ class EClassApp:
         all_text = "\n".join(page_texts)
         # v1.8.46:抓分數 — 改順序避免 X/Y 誤抓題目內文(2024/12/01、1/3 機率)
         # 1) keyword「分數/得分/成績」最可靠 → 2) 鄰近 keyword 的「X 分」 → 3) X/Y 帶合理性檢查
+        # v1.8.49:keyword 與數字間允許 0~5 個非數字字符(吃「成績為 60 分」「得分是 70 分」)
         self._last_exam_score = None
         try:
-            # 1) 「分數:65」「得分:65」「成績:65」「score:65」
-            m = re.search(r'(?:分數|得分|成績|score)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分?',
+            # 1) 「分數:65」「得分 65」「成績為 60 分」「score: 70」
+            m = re.search(r'(?:分數|得分|成績|score)[^\d\n]{0,5}(\d+(?:\.\d+)?)\s*分?',
                           all_text, re.IGNORECASE)
             if m:
                 v = float(m.group(1))
@@ -4270,6 +4272,17 @@ class EClassApp:
                         continue
         except Exception:
             self._last_exam_score = None
+        # v1.8.49:抓不到分數 dump page text 供下次調整 regex(限 3 次避免 log 爆量)
+        if self._last_exam_score is None:
+            if not hasattr(self, '_score_dump_count'):
+                self._score_dump_count = 0
+            if self._score_dump_count < 3:
+                self._score_dump_count += 1
+                try:
+                    preview = all_text.replace("\n", " | ").strip()[:400]
+                    self.log(f"🔬 [v1.8.49] 分數抓不到 dump #{self._score_dump_count}/3: {preview}")
+                except Exception:
+                    pass
         # 注意 順序：先判 fail（不通過 也含 通過 字串）
         FAIL_KEYS = ["未通過", "不及格", "未達及格", "重新測驗", "再次測驗", "尚未通過"]
         PASS_KEYS = ["恭喜通過", "已通過", "及格", "合格", "通過測驗"]
