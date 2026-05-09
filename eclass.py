@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.42"
+VERSION = "1.8.43"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2769,6 +2769,8 @@ class EClassApp:
         ALREADY_CHECK_INTERVAL = 5 * 60   # 秒
         EXAM_CHECK_INTERVAL = 30 * 60     # 秒
         already_ever_detected = False
+        # v1.8.43:wall-time 達 target 時改成「強制驗證站方時數」,只有抓不到才用 60 秒緩衝兜底
+        fallback_buffer_added = False
 
         while self.running:
             # ── 每次循環優先處理驗證彈窗（30分鐘一次，不處理會被登出）──
@@ -2824,12 +2826,31 @@ class EClassApp:
                     self.log(f"⚡ 上課 {elapsed_sec:.0f} 秒後偵測到「進行測驗」可點(站方時數抓不到時的 fallback)")
                     return
 
-            # ── 時數門檻:wall time 兜底(站方時數抓不到時用) ──
+            # ── 時數門檻:wall time 達 target 時強制驗證站方時數(v1.8.43) ──
+            # 站方達標→退出;站方仍短缺→缺額×1.5 加碼繼續上;抓不到→+60 秒緩衝兜底退
             if target_min > 0:
                 elapsed_min = (time.time() - start_time) / 60
                 if elapsed_min >= target_min:
-                    self.log(f"已上 {elapsed_min*60:.0f} 秒，達 target({target_min*60:.0f} 秒)，切換測驗/問卷")
-                    return
+                    verified = self._extract_already_from_current()
+                    if verified is not None:
+                        already_ever_detected = True
+                        already_minutes = verified
+                        if required_minutes and verified >= required_minutes:
+                            self.log(f"✓ 本機 {elapsed_min*60:.0f} 秒達 target,站方確認 {verified*60:.0f}/{required_minutes*60:.0f} 秒,切換測驗/問卷")
+                            return
+                        # 站方仍短缺 → 缺額 × 1.5 加碼繼續上
+                        new_remain_min = max(0.0, (required_minutes or 0) - verified)
+                        extra_min = max(0.5, new_remain_min * 1.5)
+                        target_min = elapsed_min + extra_min
+                        self.log(f"⚠ 本機達 target 但站方僅 {verified*60:.0f}/{(required_minutes or 0)*60:.0f} 秒,缺 {new_remain_min*60:.0f} 秒 → 加碼上 {extra_min*60:.0f} 秒")
+                    elif not fallback_buffer_added:
+                        # 站方時數抓不到 → 加 60 秒緩衝後再退(僅一次,避免無窮迴圈)
+                        target_min = elapsed_min + 1
+                        fallback_buffer_added = True
+                        self.log(f"⚠ 本機達 target 但站方時數抓不到,加 60 秒緩衝再退")
+                    else:
+                        self.log(f"已上 {elapsed_min*60:.0f} 秒,站方驗證持續失敗(緩衝已用),切換測驗/問卷")
+                        return
 
             # v1.8.29/30:優先試 pathtree.nextStep(1),依當前頁面影片時長控制推進頻率
             #          (避免切換太快 — v1.8.29 每 cycle 推一次,11 章節 30 秒推完)
