@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.35"
+VERSION = "1.8.36"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2661,13 +2661,9 @@ class EClassApp:
         # v1.8.22：「閱讀閒置提醒」對話框首次偵測時間戳
         idle_dlg_first_seen = None
         IDLE_DLG_TIMEOUT = 270  # 秒；站方倒數 297 秒，留 27 秒緩衝主動跳考避險
-
-        # v1.8.20：第一次進場立刻檢查能否測驗(避免漏掉)；之後每 30 分鐘確認一次
-        EXAM_CHECK_INTERVAL = 30 * 60  # 秒
-        if self._can_take_exam_now():
-            self.log("⚡ 進場偵測到「進行測驗」可點，跳過播放階段")
-            return
-        last_exam_check = time.time()
+        # v1.8.36:每 5 分鐘從當前頁面重抓「閱讀時數」對比 req_min(取代 _can_take_exam_now 30 分檢查)
+        last_already_check = time.time()
+        ALREADY_CHECK_INTERVAL = 5 * 60  # 秒
 
         while self.running:
             # ── 每次循環優先處理驗證彈窗（30分鐘一次，不處理會被登出）──
@@ -2699,15 +2695,20 @@ class EClassApp:
             else:
                 idle_dlg_first_seen = None
 
-            # v1.8.20：每 30 分鐘才檢查一次測驗按鈕（不再每 cycle）
-            if time.time() - last_exam_check >= EXAM_CHECK_INTERVAL:
-                last_exam_check = time.time()
-                if self._can_take_exam_now():
-                    elapsed_min = (time.time() - start_time) / 60
-                    self.log(f"⚡ 上課 {elapsed_min:.0f} 分後偵測到「進行測驗」可點 — 跳過播放階段")
-                    return
+            # v1.8.36:每 5 分鐘從當前頁面重抓「閱讀時數」對比 req_min(站方權威時數,取代按鈕 proxy)
+            if time.time() - last_already_check >= ALREADY_CHECK_INTERVAL:
+                last_already_check = time.time()
+                new_already = self._extract_already_from_current()
+                if new_already is not None and new_already > already_minutes:
+                    delta = new_already - already_minutes
+                    self.log(f"📋 站方時數更新:{already_minutes:.2f} → {new_already:.2f} 分(漲 {delta:.2f})")
+                    already_minutes = new_already
+                    target_min = max(0, required_minutes - already_minutes)
+                    if target_min == 0:
+                        self.log(f"✓ 站方時數已達標({already_minutes:.2f} ≥ {required_minutes}),退出去測驗")
+                        return
 
-            # ── 時數門檻：v1.8.23 改用 target_min(扣掉已上時數) ──
+            # ── 時數門檻:wall time 兜底(站方時數抓不到時用) ──
             if target_min > 0:
                 elapsed_min = (time.time() - start_time) / 60
                 if elapsed_min >= target_min:
@@ -2894,6 +2895,40 @@ class EClassApp:
             return self.driver.execute_script(js)
         except Exception:
             return None
+
+    def _extract_already_from_current(self):
+        """v1.8.36:從當前 driver context 任一 frame 找「閱讀時數:HH:MM:SS」字串並換算分鐘。
+        用於 _learning_loop 中途檢查站方實際時數,取代 _can_take_exam_now() 按鈕 proxy。
+        找不到回 None。
+        """
+        js = (
+            "function f(d){"
+            "  try {"
+            "    var t=(d.body && d.body.innerText) || '';"
+            "    var m=t.match(/閱讀時數\\s*[:：]\\s*(\\d+):(\\d+):(\\d+)/);"
+            "    if (m) return [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])];"
+            "  } catch(e) {}"
+            "  return null;"
+            "}"
+            "var r=f(document); if (r) return r;"
+            "var ifs=document.getElementsByTagName('iframe');"
+            "for (var i=0;i<ifs.length;i++){"
+            "  try { r=f(ifs[i].contentDocument); if (r) return r; } catch(e) {}"
+            "}"
+            "return null;"
+        )
+        try:
+            try:
+                self.driver.switch_to.default_content()
+            except Exception:
+                pass
+            result = self.driver.execute_script(js)
+            if result and len(result) == 3:
+                h, m, s = result
+                return h * 60 + m + s / 60.0
+        except Exception:
+            pass
+        return None
 
     def _detect_video_duration(self):
         """v1.8.30:偵測當前頁面 <video>.duration (秒)。跨 frame 找;找不到回 None。
