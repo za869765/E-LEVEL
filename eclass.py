@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.43"
+VERSION = "1.8.45"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -261,6 +261,37 @@ class QABank:
         with self._lock:
             return key in self.data
 
+    def add_wrong(self, question_text, wrong_label):
+        """v1.8.45：持久化 cycling 試錯結果。
+        把 wrong_label 加到該題的 wrong list（去重 normalize key,跨 session 累積）。
+        若該題尚未有 entry,建立一個只有 wrong 的骨架 entry(a 留空表示沒正解)。
+        """
+        key = self.normalize(question_text)
+        wn  = self.normalize(wrong_label)
+        if not key or not wn:
+            return
+        with self._lock:
+            entry = self.data.get(key)
+            if entry is None:
+                entry = {"q": question_text[:300], "type": "SC", "a": [], "course": "", "wrong": []}
+                self.data[key] = entry
+            wlist = entry.get("wrong") or []
+            if wn not in (self.normalize(w) for w in wlist):
+                wlist.append(wrong_label[:200])
+                entry["wrong"] = wlist
+                self._dirty = True
+
+    def get_wrong(self, question_text):
+        """v1.8.45：回傳該題已知錯選項的 normalized set;沒有就空 set。"""
+        key = self.normalize(question_text)
+        if not key:
+            return set()
+        with self._lock:
+            entry = self.data.get(key)
+            if not entry:
+                return set()
+            return {self.normalize(w) for w in (entry.get("wrong") or []) if w}
+
     def save(self):
         with self._lock:
             if not self._dirty:
@@ -364,12 +395,46 @@ class EClassApp:
     # ── v1.8.8: Gemini AI (直連 REST API，零 SDK) ────────────
 
     def _init_gemini(self):
-        key = self.config.get("gemini_api_key", "").strip()
-        if key:
-            self._gemini = key   # 單純存 key，呼叫時直接用 urllib
+        # v1.8.45:支援多筆 key 主備 fallback。
+        # 優先讀 gemini_api_keys: [{label, key}, ...] (按優先序)
+        # 沒設則 fallback 舊 gemini_api_key 欄位(視為單把「主」)
+        self._gemini_keys = []   # list[{label, key}]
+        self._gemini_key_idx = 0
+        ks = self.config.get("gemini_api_keys")
+        if isinstance(ks, list):
+            for i, item in enumerate(ks):
+                if isinstance(item, dict):
+                    k = (item.get("key") or "").strip()
+                    if k:
+                        self._gemini_keys.append({
+                            "label": item.get("label") or f"key{i+1}",
+                            "key": k,
+                        })
+        # 向後相容:舊 gemini_api_key 視為「主」(若未已包含於 keys 列)
+        legacy = (self.config.get("gemini_api_key") or "").strip()
+        if legacy and not any(k["key"] == legacy for k in self._gemini_keys):
+            self._gemini_keys.insert(0, {"label": "主(legacy)", "key": legacy})
+        # 設目前生效 key
+        self._gemini = self._gemini_keys[0]["key"] if self._gemini_keys else None
         # v1.8.13: RPM 節流 + 連續 429 計數
         self._gemini_last_call = 0.0
         self._gemini_429_streak = 0
+
+    def _switch_gemini_key(self, reason=""):
+        """v1.8.45:切換到下一把備用 key,回傳是否切成。"""
+        if not self._gemini_keys:
+            return False
+        if self._gemini_key_idx + 1 >= len(self._gemini_keys):
+            self.log(f"⚠ Gemini 所有 key 皆耗盡{('(' + reason + ')') if reason else ''},本 session 停用 AI")
+            self._gemini = None
+            return False
+        old_label = self._gemini_keys[self._gemini_key_idx]["label"]
+        self._gemini_key_idx += 1
+        nk = self._gemini_keys[self._gemini_key_idx]
+        self._gemini = nk["key"]
+        self._gemini_429_streak = 0   # 切到新 key 重設計數
+        self.log(f"🔄 Gemini「{old_label}」失效{('(' + reason + ')') if reason else ''} → 切到「{nk['label']}」")
+        return True
 
     def _gemini_call(self, prompt, timeout=15):
         """POST Gemini REST API。回傳 (text, http_status) 或 (None, status)。
@@ -450,15 +515,23 @@ class EClassApp:
             code, body = status if isinstance(status, tuple) else (0, "")
             is_quota = (code == 429 or "quota" in str(body).lower()
                         or "resource_exhausted" in str(body).lower())
+            is_auth  = (code in (401, 403) or "api key not valid" in str(body).lower()
+                        or "permission_denied" in str(body).lower())
             if is_quota:
-                # v1.8.13: 連續兩次 429 才停用，第一次先等 30 秒
+                # v1.8.13: 連續兩次 429 → v1.8.45 改成切備用 key,而非直接停用
                 self._gemini_429_streak += 1
                 if self._gemini_429_streak >= 2:
-                    self.log(f"⚠ Gemini 連續超額兩次（本次停用）: HTTP {code}")
-                    self._gemini = None
+                    self.log(f"⚠ Gemini 連續超額兩次: HTTP {code} → 嘗試切備用 key")
+                    if not self._switch_gemini_key(reason=f"quota {code}"):
+                        # 切不到備用就停用
+                        self._gemini = None
                 else:
                     self.log(f"⚠ Gemini 超額一次，等 30 秒後續用: HTTP {code}")
                     time.sleep(30)
+            elif is_auth:
+                # v1.8.45:key 失效(401/403)直接切備用,不重試
+                self.log(f"⚠ Gemini key 無效: HTTP {code} → 嘗試切備用 key")
+                self._switch_gemini_key(reason=f"auth {code}")
             else:
                 self.log(f"⚠ Gemini 錯誤: HTTP {code} {body[:100] if body else ''}")
             return []
@@ -3865,8 +3938,9 @@ class EClassApp:
         return False
 
     def _check_exam_result(self):
-        """讀結果頁判斷通過/未通過。
+        """讀結果頁判斷通過/未通過 + 抓分數(v1.8.45)。
         回傳：'pass' / 'fail' / 'unknown'
+        分數另存到 self._last_exam_score(0~100,抓不到 None)。
         """
         try:
             self.driver.switch_to.default_content()
@@ -3893,6 +3967,27 @@ class EClassApp:
                 pass
 
         all_text = "\n".join(page_texts)
+        # v1.8.45:抓分數 — 優先「X/Y」分數比,其次「X 分」「分數:X」
+        self._last_exam_score = None
+        try:
+            # 比例:65/100 或 65 / 100
+            m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', all_text)
+            if m:
+                num = float(m.group(1)); den = float(m.group(2))
+                if den > 0:
+                    self._last_exam_score = num * 100.0 / den
+            if self._last_exam_score is None:
+                # 「分數:65」「得分:65」「成績:65」
+                m = re.search(r'(?:分數|得分|成績|score)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分?', all_text, re.IGNORECASE)
+                if m:
+                    self._last_exam_score = float(m.group(1))
+            if self._last_exam_score is None:
+                # 純「65 分」(避免抓到「100 分」「0 分」這種題目內文,要鄰近結果關鍵字)
+                m = re.search(r'(?:本次|此次|您|測驗|測試)[^。\n]{0,30}?(\d+(?:\.\d+)?)\s*分', all_text)
+                if m:
+                    self._last_exam_score = float(m.group(1))
+        except Exception:
+            self._last_exam_score = None
         # 注意 順序：先判 fail（不通過 也含 通過 字串）
         FAIL_KEYS = ["未通過", "不及格", "未達及格", "重新測驗", "再次測驗", "尚未通過"]
         PASS_KEYS = ["恭喜通過", "已通過", "及格", "合格", "通過測驗"]
@@ -4518,15 +4613,18 @@ class EClassApp:
         except Exception as e:
             self.log(f"⚠ dump 失敗：{e}")
 
-    def _auto_take_exam(self, max_retries=30):
-        """v1.8.7：跨 frame + 新視窗 + 失敗自動重考
-        停止條件（任一觸發）：
-          1. 通過 (pass)
-          2. 系統作答次數已達上限 (_exam_attempts_exhausted)
-          3. 連續 8 次零學習（既無 harvester 收成，也無新 cycling 排除）
-          4. 達到 max_retries 上限（hard ceiling，預設 30）
-        「學習」=（harvester 新增題數）+（cycling 新試過的選項數）
-        只要任一非零，零學習計數就歸零，繼續累積經驗。
+    def _auto_take_exam(self, max_retries=10):
+        """v1.8.45 押題進化:
+        - 抓分數記每次 (attempt, score, answers) → 爬山反推
+        - 機率預測:第 3 次起評估,估計最終 < (pass-10) → 跳
+        - AI 動態觸發:第 5 次起,預期 10 次內過不了 + 還有未命中題 → AI 補刀
+        - 硬上限 10 次,第 11 次破例條件:當前分數 ≥ pass-5
+        終止條件(任一觸發):
+          1. 通過(pass)
+          2. 系統作答上限
+          3. 第 3 次起機率預測 < pass-10
+          4. 第 10 次失敗且 < pass-5
+          5. 第 11 次失敗(破例上限)
         """
         try:
             try:
@@ -4540,40 +4638,79 @@ class EClassApp:
                     self.log("跳測驗頁失敗，放棄自動測驗")
                     return
 
-            # v1.8.20：跳到測驗頁後先確認是否已通過 → 已通過直接視為達成不再做
+            # v1.8.20:跳到測驗頁後先確認是否已通過
             if self._exam_already_passed():
                 self.log("✓ 此課程測驗已通過，跳過不重做")
                 self._stats["courses_passed"] += 1
                 return
 
             self._stats["courses_attempted"] += 1
-            # 重置本門課的 cycling 狀態（新一門課，選項組合不一樣）
             self._exam_session_tried = {}
-            self._exam_no_learn_streak = 0
-            ZERO_LEARN_LIMIT = 8   # 連續 8 次毫無進步才放棄
             prev_qa_count = self.qa_bank.count()
+            # v1.8.45:爬山策略狀態
+            self._attempt_history = []   # [{attempt, score, answers: {qsig: [labels]}, fallback_qsigs: set}]
+            self._best_attempt = None
+            self._ai_supplement_mode = False   # AI 補刀開關(機率太低觸發)
+            # 取及格分(若已抓到,否則預設 75)
+            pass_score = self._current_exam_pass if self._current_exam_pass else 75.0
+            score_trail = []
 
             passed = False
-            for attempt in range(1, max_retries + 1):
-                self.log(f"━━ 測驗第 {attempt}/{max_retries} 次嘗試 ━━")
+            terminate_reason = "達上限"
+            attempt = 0
+            for attempt in range(1, max_retries + 2):   # 最多 11(破例)
+                # ── 第 11 次破例條件:上一次分數必須 ≥ pass-5 ──
+                if attempt == max_retries + 1:
+                    last_s = score_trail[-1] if score_trail else 0.0
+                    if last_s < pass_score - 5:
+                        terminate_reason = f"達 {max_retries} 次,當前 {last_s:.0f} < pass-5({pass_score-5:.0f}),不破例"
+                        attempt -= 1   # 沒真的跑第 11 次
+                        break
+                    self.log(f"⏩ 第 {max_retries} 次失敗但分數 {last_s:.0f} ≥ pass-5,破例試第 {attempt} 次")
+
+                self.log(f"━━ 測驗第 {attempt}/{max_retries}{' (破例)' if attempt > max_retries else ''} 次嘗試 ━━")
                 self._stats["exam_attempts"] += 1
 
-                # 紀錄答題前 cycling 已試過的選項總數（學習量量測基準）
-                tried_before = sum(len(v) for v in self._exam_session_tried.values())
+                # 答題前重置 last_answers 容器(_auto_answer_exam_questions 會填)
+                self._last_attempt_answers = {}
+                self._last_attempt_fallback_qsigs = set()
+                if self._ai_supplement_mode:
+                    self.log("🤖 本次啟用 AI 補刀模式(對未命中題優先 AI)")
 
                 ok = self._do_one_exam_attempt()
                 if not ok:
                     self.log("此次未送出成功，跳出重考迴圈")
+                    terminate_reason = "送出失敗"
                     break
 
-                # 判斷結果
                 self._human_sleep(2.5, 0.6)
                 result = self._check_exam_result()
+                score = self._last_exam_score   # 由 _check_exam_result 設定
+                score_show = f"{score:.0f}" if score is not None else "?"
+                # 軌跡用 score 或上次值兜底(避免 None 中斷)
+                score_trail.append(score if score is not None else (score_trail[-1] if score_trail else 0.0))
+
+                # 紀錄本次 attempt 到 history(爬山用)
+                snapshot = {
+                    "attempt": attempt,
+                    "score": score,
+                    "answers": dict(self._last_attempt_answers),
+                    "fallback_qsigs": set(self._last_attempt_fallback_qsigs),
+                }
+                self._attempt_history.append(snapshot)
+                # 更新 best
+                if score is not None:
+                    if self._best_attempt is None or (self._best_attempt.get("score") or -1) < score:
+                        self._best_attempt = snapshot
+                        self.log(f"⭐ 更新最高分基線:第 {attempt} 次 {score:.0f} 分")
+
+                # ── 通過 ──
                 if result == "pass":
-                    self.log(f"🎉 第 {attempt} 次：通過測驗！")
+                    self.log(f"🎉 第 {attempt} 次:通過!分數 {score_show}")
                     self._stats["exams_passed"] += 1
                     self._stats["courses_passed"] += 1
-                    # 過了之後嘗試 harvest 詳解（很多系統過了才開放）
+                    # 過了 → 把每題答案寫進題庫(鎖定正解)
+                    self._learn_from_passing_attempt(snapshot)
                     try:
                         n_h, _ = self._harvest_from_result_page()
                         if n_h > 0:
@@ -4582,12 +4719,12 @@ class EClassApp:
                     except Exception as _eh:
                         self.log(f"⚠ harvester 例外: {_eh}")
                     passed = True
+                    terminate_reason = "通過"
                     break
 
                 if result == "fail":
-                    self.log(f"❌ 第 {attempt} 次：未通過")
-                    # 學習量 1：harvester 新增題庫
-                    n_h = 0
+                    self.log(f"❌ 第 {attempt} 次:未通過,分數 {score_show}")
+                    # harvester
                     try:
                         n_h, _ = self._harvest_from_result_page()
                         if n_h > 0:
@@ -4596,65 +4733,74 @@ class EClassApp:
                     except Exception as _eh:
                         self.log(f"⚠ harvester 例外: {_eh}")
 
-                    # 學習量 2：cycling 新排除的錯選項
-                    tried_after = sum(len(v) for v in self._exam_session_tried.values())
-                    delta_tried = tried_after - tried_before
-                    if delta_tried > 0:
-                        self._stats["options_eliminated"] += delta_tried
+                    # 爬山反推:跟前一次分數比,若有上升把擾動題寫題庫
+                    self._learn_from_perturbation()
 
-                    # 任一學習量 > 0 → 計數歸零；否則 +1
-                    if (n_h > 0) or (delta_tried > 0):
-                        self._exam_no_learn_streak = 0
-                        self.log(f"📈 第 {attempt} 次學習：題庫 +{n_h}、排除 {delta_tried} 個錯選項")
-                    else:
-                        self._exam_no_learn_streak += 1
-                        self.log(f"⚠ 第 {attempt} 次零學習（連續 {self._exam_no_learn_streak}/{ZERO_LEARN_LIMIT}）")
+                    # 系統作答上限
+                    blocked, key = self._exam_attempts_exhausted()
+                    if blocked:
+                        self.log(f"🚫 系統限制:{key},停止重考")
+                        self._stats["courses_failed"] += 1
+                        terminate_reason = f"系統作答上限({key})"
+                        break
 
-                    # 第 1 次失敗一定 dump（看是否有寶藏可挖）
+                    # 機率預測:第 3 次起評估
+                    if (attempt >= 3 and score is not None and len(score_trail) >= 3
+                            and score_trail[0] is not None):
+                        first_s = score_trail[0]
+                        avg_growth = (score - first_s) / max(1, attempt - 1)
+                        remaining = max_retries - attempt   # 還能跑幾次(不含破例)
+                        predicted = score + remaining * avg_growth
+                        self.log(f"📊 機率預測:當前 {score:.0f},平均 +{avg_growth:.1f}/次,剩 {remaining} 次,估最終 {predicted:.0f} (pass {pass_score:.0f})")
+                        if predicted < pass_score - 10:
+                            self.log(f"📉 估最終 {predicted:.0f} < pass-10({pass_score-10:.0f}) → 跳本門")
+                            self._stats["courses_failed"] += 1
+                            terminate_reason = f"機率太低(估 {predicted:.0f} < {pass_score-10:.0f})"
+                            break
+                        # AI 補刀觸發:第 5 次起,估最終 < pass + 還有未命中題 + 有 Gemini key
+                        if (attempt >= 5 and not self._ai_supplement_mode
+                                and self._gemini and predicted < pass_score
+                                and self._last_attempt_fallback_qsigs):
+                            self.log(f"🤖 AI 補刀啟動:估最終 {predicted:.0f} < pass {pass_score:.0f},還有 {len(self._last_attempt_fallback_qsigs)} 題未命中")
+                            self._ai_supplement_mode = True
+
+                    # 第 10 次失敗且當前 < pass-5 → 不破例
+                    if attempt == max_retries:
+                        if score is None or score < pass_score - 5:
+                            self.log(f"🛑 達 {max_retries} 次,當前 {score_show} < pass-5,放棄")
+                            self._stats["courses_failed"] += 1
+                            terminate_reason = f"達 {max_retries} 次,分數 {score_show} 距 pass 太遠"
+                            break
+                        # 否則進入下一個迴圈嘗試(第 11 次破例)
+
+                    # 第 1 次失敗 dump
                     if attempt == 1:
                         try:
                             self._dump_failed_page(attempt)
                         except Exception:
                             pass
 
-                    # 系統作答次數限制？
-                    blocked, key = self._exam_attempts_exhausted()
-                    if blocked:
-                        self.log(f"🚫 系統限制：{key}，停止重考")
-                        self._stats["courses_failed"] += 1
-                        break
-
-                    # 連續零學習 → 放棄
-                    if self._exam_no_learn_streak >= ZERO_LEARN_LIMIT:
-                        self.log(f"🛑 連續 {ZERO_LEARN_LIMIT} 次零學習，停止重考（已嘗試 {attempt} 次）")
-                        self._stats["courses_failed"] += 1
-                        break
-
-                    if attempt >= max_retries:
-                        self.log(f"已達最大重考次數 {max_retries}，放棄")
-                        self._stats["courses_failed"] += 1
-                        break
-
-                    # 關掉測驗視窗 → 回主視窗 → 重新跳到測驗頁
+                    # 重新跳測驗頁
                     self._close_extra_windows()
                     self._human_sleep(2.0, 0.5)
                     if not self._try_jump_to_exam_sysbar():
                         self.log("無法重新跳測驗頁，停止重考")
                         self._stats["courses_failed"] += 1
+                        terminate_reason = "無法重跳測驗頁"
                         break
                 else:
-                    self.log("無法判斷結果（unknown），保守視為完成")
+                    self.log("無法判斷結果(unknown),保守視為完成")
+                    terminate_reason = "結果頁無法判讀"
                     break
 
-            # 統計這門課的成長
+            # 收尾
             grown = self.qa_bank.count() - prev_qa_count
             total_tried = sum(len(v) for v in self._exam_session_tried.values())
-            if grown > 0 or total_tried > 0:
-                self.log(f"📈 本門課總成長：題庫 +{grown}、cycling 排除 {total_tried} 個錯選項（題庫總計 {self.qa_bank.count()}）")
+            trail_str = "→".join(f"{s:.0f}" for s in score_trail) if score_trail else "—"
+            self.log(f"📊 本門終止:[{terminate_reason}] 第 {attempt} 次,分數軌跡 {trail_str},題庫 +{grown},cycling 排除 {total_tried}")
             if not passed:
-                self.log(f"💔 本門課未過關（嘗試 {attempt} 次）")
+                self.log(f"💔 本門未過關")
 
-            # 收尾：關所有額外視窗
             self._close_extra_windows()
         except Exception as e:
             self.log(f"自動測驗失敗: {e}")
@@ -4662,6 +4808,83 @@ class EClassApp:
                 self._close_extra_windows()
             except Exception:
                 pass
+
+    # ── v1.8.45:爬山輔助 ────────────────────────────────────
+
+    def _learn_from_passing_attempt(self, snapshot):
+        """v1.8.45:通過時,把每題答案寫進題庫(鎖定正解)。
+        snapshot.answers: {qsig: [picked_labels]} 但我們需要 qtext 作為 key。
+        實作:題庫 add 走 qtext;這裡靠 _last_attempt_q_by_sig 對應(_auto_answer 紀錄)。
+        """
+        try:
+            q_by_sig = getattr(self, "_last_attempt_q_by_sig", {}) or {}
+            type_by_sig = getattr(self, "_last_attempt_type_by_sig", {}) or {}
+            n = 0
+            for qsig, labels in (snapshot.get("answers") or {}).items():
+                qtext = q_by_sig.get(qsig, "")
+                if not qtext or not labels:
+                    continue
+                qtype = type_by_sig.get(qsig, "SC")
+                # add 預設 overwrite=True → 覆寫(高信任度)
+                self.qa_bank.add(qtext, labels, qtype=qtype,
+                                 course=getattr(self, "_current_course_title", ""))
+                n += 1
+            if n > 0:
+                self.qa_bank.save()
+                self.log(f"⭐ 通過解鎖:寫入 {n} 題正解到題庫")
+        except Exception as e:
+            self.log(f"⚠ _learn_from_passing_attempt 例外: {e}")
+
+    def _learn_from_perturbation(self):
+        """v1.8.45:失敗後,跟上一次比較分數差。
+        - 分數↑ → 本次擾動的題答案可能對 → 候選地寫進題庫(low confidence,只寫 qsig 還沒有 a 的題)
+        - 分數↓ → 上一次擾動的題答案可能對(已過保留邏輯,這裡不主動還原)
+        - 分數=  → 不動
+        為避免誤鎖,只在「比 best 還高」時才寫入。
+        """
+        try:
+            hist = self._attempt_history
+            if len(hist) < 2:
+                return
+            cur = hist[-1]
+            best_before = max(
+                (h for h in hist[:-1] if h.get("score") is not None),
+                key=lambda h: h["score"],
+                default=None,
+            )
+            if cur.get("score") is None or best_before is None:
+                return
+            cur_s = cur["score"]; prev_s = best_before["score"]
+            delta = cur_s - prev_s
+            if delta <= 0:
+                return
+            # 找本次相比 best_before 變化的 fallback 題(答案不同)
+            q_by_sig = getattr(self, "_last_attempt_q_by_sig", {}) or {}
+            type_by_sig = getattr(self, "_last_attempt_type_by_sig", {}) or {}
+            cur_ans = cur.get("answers") or {}
+            prev_ans = best_before.get("answers") or {}
+            n_lock = 0
+            for qsig in cur.get("fallback_qsigs") or set():
+                cur_labs = cur_ans.get(qsig) or []
+                prev_labs = prev_ans.get(qsig) or []
+                if set(cur_labs) == set(prev_labs):
+                    continue   # 沒改答案
+                qtext = q_by_sig.get(qsig, "")
+                if not qtext:
+                    continue
+                # 只寫 a 還空的 entry(不覆寫 harvester 拔到的高信任正解)
+                existing = self.qa_bank.find(qtext)
+                if existing and existing.get("a"):
+                    continue
+                qtype = type_by_sig.get(qsig, "SC")
+                self.qa_bank.add(qtext, cur_labs, qtype=qtype,
+                                 course=getattr(self, "_current_course_title", ""))
+                n_lock += 1
+            if n_lock > 0:
+                self.qa_bank.save()
+                self.log(f"📈 分數 {prev_s:.0f}→{cur_s:.0f} (+{delta:.0f}),爬山候選鎖定 {n_lock} 題答案")
+        except Exception as e:
+            self.log(f"⚠ _learn_from_perturbation 例外: {e}")
 
     # ── 答題：題庫優先，押題 fallback ─────────────────────
 
@@ -5010,6 +5233,22 @@ class EClassApp:
             n_opt_hit  = 0  # v1.8.9: 選項池直配命中
             n_ai_hit   = 0  # v1.8.8：Gemini AI 命中
             n_fallback = 0
+            # v1.8.45:本次 attempt 答題紀錄(爬山用,_auto_take_exam 讀)
+            self._last_attempt_q_by_sig = {}    # qsig -> qtext
+            self._last_attempt_type_by_sig = {} # qsig -> "SC"/"MC"/"TF"
+            # _last_attempt_answers / _last_attempt_fallback_qsigs 由 _auto_take_exam 預設 init
+            if not hasattr(self, "_last_attempt_answers"):
+                self._last_attempt_answers = {}
+            if not hasattr(self, "_last_attempt_fallback_qsigs"):
+                self._last_attempt_fallback_qsigs = set()
+            _qsig_by_name = {}   # name -> qsig (sweep 用)
+            # v1.8.45 AI 補刀:取上一輪 fallback qsigs(本次優先用 AI)
+            _prev_fallback_qsigs = set()
+            if (getattr(self, "_ai_supplement_mode", False)
+                    and getattr(self, "_attempt_history", None)):
+                _prev_fallback_qsigs = (self._attempt_history[-1].get("fallback_qsigs") or set())
+                if _prev_fallback_qsigs:
+                    self.log(f"🤖 AI 補刀:本次對 {len(_prev_fallback_qsigs)} 題(上輪 fallback) 優先 AI")
 
             # v1.8.9: 選項池直配 — 用該課程所有已知正解建 set
             # v1.8.11: 加診斷 log，pool 為空 / 課程名不匹配時也告知
@@ -5052,7 +5291,17 @@ class EClassApp:
 
                 # 2) 取題目文字（用第一個 input 往上找）
                 qtext = self._get_question_text(opts[0][0])
-                hit = self.qa_bank.find(qtext) if qtext else None
+                # v1.8.45:算 qsig + 推測 qtype 給 sweep 用
+                qsig = self._options_signature(opts, qtext=qtext or "")
+                qtype_inferred = ("MC" if (opts and opts[0][2] == "checkbox")
+                                  else ("TF" if len(opts) == 2 else "SC"))
+                if qsig:
+                    _qsig_by_name[name] = qsig
+                    self._last_attempt_q_by_sig[qsig] = qtext or ""
+                    self._last_attempt_type_by_sig[qsig] = qtype_inferred
+                # v1.8.45 AI 補刀:若該題上輪是 fallback 題且補刀模式已啟用,跳過題庫命中強制走 AI
+                _use_ai_first = (qsig and qsig in _prev_fallback_qsigs and self._gemini)
+                hit = None if _use_ai_first else (self.qa_bank.find(qtext) if qtext else None)
 
                 if hit:
                     n_db_hit += 1
@@ -5212,6 +5461,9 @@ class EClassApp:
                                 continue  # 跳過 fallback
 
                     n_fallback += 1
+                    # v1.8.45:標記為 fallback 題(爬山追蹤用)
+                    if qsig:
+                        self._last_attempt_fallback_qsigs.add(qsig)
                     self._fallback_answer_group(opts, qtext=qtext)
                     qshow = qtext[:60] + ("..." if len(qtext) > 60 else "")
                     if qtext:
@@ -5233,6 +5485,23 @@ class EClassApp:
                             pass
                     else:
                         self.log(f"❓ 抓不到題目文字（name={name}）")
+
+            # v1.8.45:答題完成 sweep — 抓每題目前 selected 的 labels(爬山反推用)
+            try:
+                for name, opts in groups.items():
+                    qsig = _qsig_by_name.get(name) or ""
+                    if not qsig or not opts:
+                        continue
+                    picked = []
+                    for inp, lab, _t in opts:
+                        try:
+                            if inp.is_selected() and lab:
+                                picked.append(lab)
+                        except Exception:
+                            pass
+                    self._last_attempt_answers[qsig] = picked
+            except Exception:
+                pass
 
             self.log(f"答題完成（{n_total} 題：題庫 {n_db_hit} / 選項池 {n_opt_hit} / AI {n_ai_hit} / 押題 {n_fallback}）")
             try:
@@ -5379,6 +5648,9 @@ class EClassApp:
         # v1.8.7 bug #3: 傳入 qtext，每題獨立 tried set，避免 TF 共用「對/錯」signature
         sig = self._options_signature(opts, qtext=qtext or "")
         tried = self._exam_session_tried.setdefault(sig, set())
+        # v1.8.45:把題庫 known wrong 預載入 tried(持久化的 cycling),跨 session 不重蹈覆轍
+        if qtext:
+            tried |= self.qa_bank.get_wrong(qtext)
         polarity = self._question_polarity(qtext or "")
 
         def _norm_lab(lab):
@@ -5390,6 +5662,16 @@ class EClassApp:
                 return True
             except Exception:
                 return False
+
+        def _record_wrong(lab):
+            """v1.8.45:cycling 試完後失敗 → 寫進題庫 wrong(持久化)"""
+            nl = _norm_lab(lab)
+            tried.add(nl)
+            if qtext and lab:
+                try:
+                    self.qa_bank.add_wrong(qtext, lab)
+                except Exception:
+                    pass
 
         try:
             # ── 多選題 (checkbox) ──
@@ -5404,7 +5686,7 @@ class EClassApp:
                             except Exception:
                                 pass
                         if _click(inp):
-                            tried.add(_norm_lab(lab))
+                            _record_wrong(lab)
                             return
                 # 2. 全勾，但跳過「以上皆非」與絕對化詞（找對題型才避絕對化）
                 clicked_any = False
@@ -5417,7 +5699,7 @@ class EClassApp:
                         if not inp.is_selected():
                             if _click(inp):
                                 clicked_any = True
-                                tried.add(_norm_lab(lab))
+                                _record_wrong(lab)
                     except Exception:
                         pass
                 if clicked_any:
@@ -5435,20 +5717,20 @@ class EClassApp:
                         sl = (lab or "").strip().lower()
                         if any(k.lower() in sl for k in NO_KEYS) and _norm_lab(lab) not in tried:
                             if _click(inp):
-                                tried.add(_norm_lab(lab))
+                                _record_wrong(lab)
                                 return
                 # 預設偏好「對／是」
                 for inp, lab, _t in opts:
                     sl = (lab or "").strip().lower()
                     if any(k.lower() in sl for k in YES_KEYS) and _norm_lab(lab) not in tried:
                         if _click(inp):
-                            tried.add(_norm_lab(lab))
+                            _record_wrong(lab)
                             return
                 # cycling：找未試過的
                 for inp, lab, _t in opts:
                     if _norm_lab(lab) not in tried:
                         if _click(inp):
-                            tried.add(_norm_lab(lab))
+                            _record_wrong(lab)
                             return
                 _click(opts[0][0])
                 return
@@ -5459,7 +5741,7 @@ class EClassApp:
                 for inp, lab, _t in opts:
                     if self._is_all_above(lab) and _norm_lab(lab) not in tried:
                         if _click(inp):
-                            tried.add(_norm_lab(lab))
+                            _record_wrong(lab)
                             return
             # 2. polarity = neg：含絕對化字眼的選項 = 正解
             if polarity == "neg":
@@ -5470,7 +5752,7 @@ class EClassApp:
                     abs_opts.sort(key=lambda x: len(x[1] or ""), reverse=True)
                     inp, lab = abs_opts[0]
                     if _click(inp):
-                        tried.add(_norm_lab(lab))
+                        _record_wrong(lab)
                         return
             # 3. cycling：選未試過、非「以上皆非」的最長 label
             #    polarity = pos → 排除絕對化字眼
@@ -5486,7 +5768,7 @@ class EClassApp:
                 untried.sort(key=lambda x: len(x[1] or ""), reverse=True)
                 inp, lab = untried[0]
                 if _click(inp):
-                    tried.add(_norm_lab(lab))
+                    _record_wrong(lab)
                     return
             # 4. 退到原本被排除的（含絕對化／以上皆非）
             untried2 = [(inp, lab) for (inp, lab, _t) in opts
@@ -5495,7 +5777,7 @@ class EClassApp:
                 untried2.sort(key=lambda x: len(x[1] or ""), reverse=True)
                 inp, lab = untried2[0]
                 if _click(inp):
-                    tried.add(_norm_lab(lab))
+                    _record_wrong(lab)
                     return
             # 5. 全試過 → 隨機
             try:
