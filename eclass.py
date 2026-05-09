@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.45"
+VERSION = "1.8.46"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -233,6 +233,7 @@ class QABank:
         v1.8.7 bug #5：加 overwrite 參數（預設 True 保留原行為）。
           harvester 從結果頁挖到正解 → upsert（高信任度）
           prefetch 從痞客幫抓到 → add_if_absent（低信任度，不覆蓋既有）
+        v1.8.46:保留既有 wrong 欄位(cycling 持久化),避免被覆寫清空。
         """
         key = self.normalize(question_text)
         if not key:
@@ -240,12 +241,19 @@ class QABank:
         with self._lock:
             if (not overwrite) and key in self.data:
                 return
-            self.data[key] = {
+            # v1.8.46:救出舊 entry 的 wrong list,避免 add 覆寫時遺失
+            existing_wrong = []
+            if key in self.data:
+                existing_wrong = list(self.data[key].get("wrong") or [])
+            entry = {
                 "q": question_text[:300],
                 "type": qtype,
                 "a": list(answers) if isinstance(answers, (list, tuple)) else [answers],
                 "course": course or "",
             }
+            if existing_wrong:
+                entry["wrong"] = existing_wrong
+            self.data[key] = entry
             self._option_index = None   # v1.8.9: invalidate cache
             self._dirty = True
 
@@ -3967,25 +3975,36 @@ class EClassApp:
                 pass
 
         all_text = "\n".join(page_texts)
-        # v1.8.45:抓分數 — 優先「X/Y」分數比,其次「X 分」「分數:X」
+        # v1.8.46:抓分數 — 改順序避免 X/Y 誤抓題目內文(2024/12/01、1/3 機率)
+        # 1) keyword「分數/得分/成績」最可靠 → 2) 鄰近 keyword 的「X 分」 → 3) X/Y 帶合理性檢查
         self._last_exam_score = None
         try:
-            # 比例:65/100 或 65 / 100
-            m = re.search(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', all_text)
+            # 1) 「分數:65」「得分:65」「成績:65」「score:65」
+            m = re.search(r'(?:分數|得分|成績|score)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分?',
+                          all_text, re.IGNORECASE)
             if m:
-                num = float(m.group(1)); den = float(m.group(2))
-                if den > 0:
-                    self._last_exam_score = num * 100.0 / den
+                v = float(m.group(1))
+                if 0 <= v <= 100:
+                    self._last_exam_score = v
+            # 2) 「本次/此次/您 ... X 分」鄰近 keyword
             if self._last_exam_score is None:
-                # 「分數:65」「得分:65」「成績:65」
-                m = re.search(r'(?:分數|得分|成績|score)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分?', all_text, re.IGNORECASE)
+                m = re.search(r'(?:本次|此次|您|測驗|測試)[^。\n]{0,30}?(\d+(?:\.\d+)?)\s*分',
+                              all_text)
                 if m:
-                    self._last_exam_score = float(m.group(1))
+                    v = float(m.group(1))
+                    if 0 <= v <= 100:
+                        self._last_exam_score = v
+            # 3) X/Y 比例 — 加合理性檢查(分母常見滿分,分子 0~分母)避免抓到日期/題目內文
             if self._last_exam_score is None:
-                # 純「65 分」(避免抓到「100 分」「0 分」這種題目內文,要鄰近結果關鍵字)
-                m = re.search(r'(?:本次|此次|您|測驗|測試)[^。\n]{0,30}?(\d+(?:\.\d+)?)\s*分', all_text)
-                if m:
-                    self._last_exam_score = float(m.group(1))
+                COMMON_DENS = {10, 20, 25, 50, 100, 200}
+                for m in re.finditer(r'(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', all_text):
+                    try:
+                        num = float(m.group(1)); den = float(m.group(2))
+                        if den in COMMON_DENS and 0 <= num <= den:
+                            self._last_exam_score = num * 100.0 / den
+                            break
+                    except Exception:
+                        continue
         except Exception:
             self._last_exam_score = None
         # 注意 順序：先判 fail（不通過 也含 通過 字串）
@@ -4744,25 +4763,31 @@ class EClassApp:
                         terminate_reason = f"系統作答上限({key})"
                         break
 
-                    # 機率預測:第 3 次起評估
-                    if (attempt >= 3 and score is not None and len(score_trail) >= 3
-                            and score_trail[0] is not None):
-                        first_s = score_trail[0]
-                        avg_growth = (score - first_s) / max(1, attempt - 1)
-                        remaining = max_retries - attempt   # 還能跑幾次(不含破例)
-                        predicted = score + remaining * avg_growth
-                        self.log(f"📊 機率預測:當前 {score:.0f},平均 +{avg_growth:.1f}/次,剩 {remaining} 次,估最終 {predicted:.0f} (pass {pass_score:.0f})")
-                        if predicted < pass_score - 10:
-                            self.log(f"📉 估最終 {predicted:.0f} < pass-10({pass_score-10:.0f}) → 跳本門")
-                            self._stats["courses_failed"] += 1
-                            terminate_reason = f"機率太低(估 {predicted:.0f} < {pass_score-10:.0f})"
-                            break
-                        # AI 補刀觸發:第 5 次起,估最終 < pass + 還有未命中題 + 有 Gemini key
-                        if (attempt >= 5 and not self._ai_supplement_mode
-                                and self._gemini and predicted < pass_score
-                                and self._last_attempt_fallback_qsigs):
-                            self.log(f"🤖 AI 補刀啟動:估最終 {predicted:.0f} < pass {pass_score:.0f},還有 {len(self._last_attempt_fallback_qsigs)} 題未命中")
-                            self._ai_supplement_mode = True
+                    # 機率預測:第 3 次起評估(v1.8.46 修:過濾 None + 用最近 3 次成長率)
+                    if attempt >= 3 and score is not None:
+                        valid_scores = [s for s in score_trail if s is not None]
+                        avg_growth = None
+                        if len(valid_scores) >= 3:
+                            # 用最近 3 次:跨 2 步的平均成長,避免被第 1 次運氣拖累
+                            recent = valid_scores[-3:]
+                            avg_growth = (recent[-1] - recent[0]) / 2.0
+                        elif len(valid_scores) >= 2:
+                            avg_growth = (valid_scores[-1] - valid_scores[0]) / max(1, len(valid_scores) - 1)
+                        if avg_growth is not None:
+                            remaining = max_retries - attempt   # 還能跑幾次(不含破例)
+                            predicted = score + remaining * avg_growth
+                            self.log(f"📊 機率預測:當前 {score:.0f},近 3 次平均 +{avg_growth:.1f}/次,剩 {remaining} 次,估最終 {predicted:.0f} (pass {pass_score:.0f})")
+                            if predicted < pass_score - 10:
+                                self.log(f"📉 估最終 {predicted:.0f} < pass-10({pass_score-10:.0f}) → 跳本門")
+                                self._stats["courses_failed"] += 1
+                                terminate_reason = f"機率太低(估 {predicted:.0f} < {pass_score-10:.0f})"
+                                break
+                            # AI 補刀觸發:第 5 次起,估最終 < pass + 還有未命中題 + 有 Gemini key
+                            if (attempt >= 5 and not self._ai_supplement_mode
+                                    and self._gemini and predicted < pass_score
+                                    and self._last_attempt_fallback_qsigs):
+                                self.log(f"🤖 AI 補刀啟動:估最終 {predicted:.0f} < pass {pass_score:.0f},還有 {len(self._last_attempt_fallback_qsigs)} 題未命中")
+                                self._ai_supplement_mode = True
 
                     # 第 10 次失敗且當前 < pass-5 → 不破例
                     if attempt == max_retries:
