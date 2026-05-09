@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.39"
+VERSION = "1.8.40"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2233,6 +2233,14 @@ class EClassApp:
         req = 0
         try:
             body = self.driver.find_element(By.TAG_NAME, "body").text
+            # v1.8.40:visible body.text 不含 hidden tab(認證時數通常 hidden) →
+            # 用 textContent 抓全部(含 hidden)讓 regex 找得到「通過條件」門檻字串
+            try:
+                body_full = self.driver.execute_script(
+                    "return document.body && document.body.textContent || '';"
+                ) or body
+            except Exception:
+                body_full = body
 
             # v1.8.23：多行 dump（給階段 2 收斂 selector 用）
             KEYS = ("分鐘", "小時", "時數", "分數", "及格", "合格", "通過",
@@ -2246,10 +2254,11 @@ class EClassApp:
                     self.log(f"📋 {line}")
                     seen.add(line)
 
-            # v1.8.39:時數門檻優先抓「通過條件」中的「閱讀時數:HH:MM:SS(含)以上」(真實門檻)
+            # v1.8.39/40:時數門檻優先抓「通過條件」中的「閱讀時數:HH:MM:SS(含)以上」(真實門檻)
+            #          v1.8.40:用 body_full(textContent) 因為認證時數 tab 可能 hidden
             #          fallback 才用「總時數 50%」(以前的錯誤推估)
             req_from_pass = None
-            m_pass = re.search(r'閱讀時數\s*[:：]?\s*(\d+):(\d+):(\d+)\s*[(（][^)）]*[)）]\s*以上', body)
+            m_pass = re.search(r'閱讀時數\s*[:：]?\s*(\d+):(\d+):(\d+)\s*[(（][^)）]*[)）]\s*以上', body_full)
             if m_pass:
                 h, mi, s = int(m_pass.group(1)), int(m_pass.group(2)), int(m_pass.group(3))
                 req_from_pass = int(h * 60 + mi + s / 60.0)
@@ -2258,11 +2267,11 @@ class EClassApp:
                 self.log(f"時數門檻：通過條件規定至少 {req*60} 秒(權威來源)")
             else:
                 # fallback 50% 推估
-                m = re.search(r'(\d+(?:\.\d+)?)\s*小時', body)
+                m = re.search(r'(\d+(?:\.\d+)?)\s*小時', body_full)
                 if m:
                     req = int(float(m.group(1)) * 60 * 0.5)
                 else:
-                    m2 = re.search(r'(\d+)\s*分鐘', body)
+                    m2 = re.search(r'(\d+)\s*分鐘', body_full)
                     if m2:
                         req = int(int(m2.group(1)) * 0.5)
                 if req:
@@ -2270,7 +2279,7 @@ class EClassApp:
 
             # v1.8.25/39:抓「已上時數」 — 排除「(含)以上」(那是門檻不是已上)
             already = None
-            for m_hms in re.finditer(r'閱讀時數\s*[:：]\s*(\d+):(\d+):(\d+)([^\n]{0,15})', body):
+            for m_hms in re.finditer(r'閱讀時數\s*[:：]\s*(\d+):(\d+):(\d+)([^\n]{0,15})', body_full):
                 rest = m_hms.group(4) or ""
                 if "以上" in rest:
                     continue   # 這是門檻字串,跳過
@@ -2283,7 +2292,7 @@ class EClassApp:
                     r'\s*(?:閱讀|上課|學習|課程)?\s*時數\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分',
                     r'(?:已上|目前|累計|本次)\s*(\d+(?:\.\d+)?)\s*分',
                 ):
-                    m3 = re.search(pat, body)
+                    m3 = re.search(pat, body_full)
                     if m3:
                         already = float(m3.group(1))
                         break
@@ -2293,12 +2302,12 @@ class EClassApp:
 
             # v1.8.24：詳情頁補抓分數/及格門檻 — 用 findall 取最後一筆(避免歷史紀錄)
             if self._current_exam_score is None:
-                ms = re.findall(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
+                ms = re.findall(r'測驗分數\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body_full)
                 if ms:
                     self._current_exam_score = float(ms[-1])
             if self._current_exam_pass is None:
-                ms = re.findall(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻)'
-                                r'\s*[:：]\s*(\d+(?:\.\d+)?)\s*分', body)
+                ms = re.findall(r'(?:及格分數|合格分數|通過分數|最低分數|及格門檻|合格門檻|課程測驗)'
+                                r'\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分', body_full)
                 if ms:
                     self._current_exam_pass = float(ms[-1])
         except Exception:
