@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.56"
+VERSION = "1.8.57"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -2990,6 +2990,82 @@ class EClassApp:
         except Exception: pass
         return False
 
+    def _click_idle_dialog_confirm(self):
+        """v1.8.57:閱讀閒置提醒「確定」按鈕專屬 click(實機驗證 HTML 結構)
+
+        HTML(港都e學苑 kcg.elearn 確認):
+          <input type="button"
+                 onclick="parent.s_catalog.pathtree.stop_countdown();"
+                 value="確定">
+        放在某個 child frame 內(parent 通常是 s_catalog)。
+
+        v1.8.22 _dismiss_player_popup 的 xpath `contains(normalize-space(.),'確定')`
+        對 <input> 抓不到 — input 文字在 value 屬性,不在 element text。
+        本函式直接用 querySelectorAll 找 input[value='確定'] + onclick 含 stop_countdown,
+        跨 document + 所有 iframe/frame(含 nested)。
+        """
+        js_click = r"""
+        (function(){
+          function findIn(d){
+            try {
+              // 優先 1:input[type=button] value=確定 + onclick 含 stop_countdown
+              var inputs = d.querySelectorAll("input[type='button']");
+              for (var i=0; i<inputs.length; i++){
+                var v = (inputs[i].getAttribute('value') || '').trim();
+                if (v === '確定') {  // '確定'
+                  var oc = inputs[i].getAttribute('onclick') || '';
+                  if (oc.indexOf('stop_countdown') >= 0 || oc.indexOf('countdown') >= 0) {
+                    inputs[i].click();
+                    return 'specific';
+                  }
+                }
+              }
+              // 優先 2:任何 input value=確定(沒 onclick 限定,但限 input)
+              for (var j=0; j<inputs.length; j++){
+                var v2 = (inputs[j].getAttribute('value') || '').trim();
+                if (v2 === '確定') {
+                  inputs[j].click();
+                  return 'fallback';
+                }
+              }
+            } catch(e) {}
+            return null;
+          }
+          // 主 document
+          var r = findIn(document);
+          if (r) return r;
+          // 一層 iframe/frame
+          var fs = document.querySelectorAll('iframe, frame');
+          for (var k=0; k<fs.length; k++){
+            try {
+              var doc1 = fs[k].contentDocument;
+              if (!doc1) continue;
+              var r1 = findIn(doc1);
+              if (r1) return r1;
+              // 二層 nested iframe/frame
+              var fs2 = doc1.querySelectorAll('iframe, frame');
+              for (var m=0; m<fs2.length; m++){
+                try {
+                  var doc2 = fs2[m].contentDocument;
+                  if (!doc2) continue;
+                  var r2 = findIn(doc2);
+                  if (r2) return r2;
+                } catch(e2) {}
+              }
+            } catch(e1) {}
+          }
+          return null;
+        })();
+        """
+        try:
+            r = self.driver.execute_script(js_click)
+            if r:
+                self.log(f"✓ [v1.8.57] 已點閱讀閒置提醒「確定」按鈕(策略: {r})")
+                return True
+        except Exception as e:
+            self.log(f"⚠ idle 確定按鈕點擊例外: {e}")
+        return False
+
     def _check_kicked_alert(self):
         """v1.8.52:Y1 偵測「由於你的帳號閒置過久已被登出」瀏覽器原生 alert
         回傳:True=有此 alert 且已 accept,False=無或非閒置 alert
@@ -3221,6 +3297,12 @@ class EClassApp:
 
             # v1.8.22：偵測「閱讀閒置提醒」對話框（_dismiss_player_popup 嘗試後仍在）
             if self._idle_dialog_visible():
+                # v1.8.57:先試針對性 click「確定」按鈕(基於實機 dump 確認的 selector)
+                # 成功 → reset 倒數;失敗 → 退到原 270 秒超時跳測驗邏輯
+                if self._click_idle_dialog_confirm():
+                    idle_dlg_first_seen = None
+                    self._human_sleep(2.0, 0.5)
+                    continue
                 if idle_dlg_first_seen is None:
                     idle_dlg_first_seen = time.time()
                     self.log("⚠ 偵測到「閱讀閒置提醒」對話框，找不到「確定」按鈕；270 秒後將主動跳測驗頁")
