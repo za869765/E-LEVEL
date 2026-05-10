@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.52"
+VERSION = "1.8.53"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -599,7 +599,9 @@ class EClassApp:
         return text, status
 
     def _ask_ai(self, qtext, opts):
-        """v1.8.8: 呼叫 Gemini API 答題。回傳命中的 (inp, lab, itype) list。"""
+        """v1.8.8: 呼叫 Gemini API 答題。回傳命中的 (inp, lab, itype) list。
+        v1.8.53:F3 prompt 加題型偵測 + 限定回答格式(避免是非題答名詞)
+        """
         if not self._gemini or not qtext:
             return []
         course = getattr(self, "_current_course_title", "") or ""
@@ -607,12 +609,24 @@ class EClassApp:
             f"{chr(65 + i)}. {lab}"
             for i, (_, lab, _) in enumerate(opts) if lab
         )
+        # v1.8.53:F3 偵測題型 — 是非題(2 選項) prompt 限定 T/F 二擇一
+        is_tf = (len(opts) == 2)
+        if is_tf:
+            answer_instr = (
+                "這是是非題,請只回答 T 或 F(T=對/正確/是,F=錯/錯誤/否),"
+                "不要任何解釋、不要回答完整選項文字。"
+            )
+        else:
+            answer_instr = (
+                "請直接回答「正確選項的完整文字」,若有多個正解請每行一個,"
+                "不要任何解釋、不要加「正確答案:」「答案:」等前綴。"
+            )
         prompt = (
             f"你是台灣公務員訓練考試的答題助手。\n"
             f"課程：{course}\n"
             f"題目：{qtext}\n"
             f"選項：\n{opt_lines}\n\n"
-            f"請直接回答「正確選項的完整文字」，若有多個正解請每行一個，不要任何解釋。"
+            f"{answer_instr}"
         )
         text, status = self._gemini_call(prompt)
         if text is None:
@@ -655,8 +669,12 @@ class EClassApp:
                 if not lab:
                     continue
             for line in text.splitlines():
-                line_clean = re.sub(r'^[（(]?[A-Da-d][)）.、]\s*', '',
-                                    line.strip())
+                line = line.strip()
+                # v1.8.53:F3 strip「正確答案:」「答案:」「正確選項的完整文字:」「正解:」等 prefix
+                # (Gemini 有時不顧 prompt 還是加 prefix,這裡做保險)
+                line = re.sub(r'^(?:正確答案|答案|正解|正確選項(?:的完整文字)?)\s*[：:]\s*',
+                              '', line)
+                line_clean = re.sub(r'^[（(]?[A-Da-d][)）.、]\s*', '', line)
                 if not line_clean:
                     continue
                 if self._texts_match(lab, line_clean):
@@ -5267,6 +5285,14 @@ class EClassApp:
                 return t.strip()
         except Exception:
             pass
+        # 5. v1.8.53:F1 fallback value 屬性(是非題 radio 常 value=「1/2」「對/錯」「T/F」)
+        # v1.8.51 dump 證實:是非題的 lab 抓回來空字串,但 input 有 value 屬性
+        try:
+            v = (input_el.get_attribute("value") or "").strip()
+            if v:
+                return v
+        except Exception:
+            pass
         return ""
 
     def _cleanup_qtext(self, text):
@@ -5640,6 +5666,9 @@ class EClassApp:
                 # v1.8.45 AI 補刀:若該題上輪是 fallback 題且補刀模式已啟用,跳過題庫命中強制走 AI
                 _use_ai_first = (qsig and qsig in _prev_fallback_qsigs and self._gemini)
                 hit = None if _use_ai_first else (self.qa_bank.find(qtext) if qtext else None)
+                # v1.8.53:F2 hit 但 a=[] (題庫有題目但無正解) → 視為沒命中,走 AI/pool/押題 fallback
+                if hit and not (hit.get("a") or []):
+                    hit = None
 
                 if hit:
                     n_db_hit += 1
