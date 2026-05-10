@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.50"
+VERSION = "1.8.51"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -5629,6 +5629,23 @@ class EClassApp:
                         # 答案文字配不到任何選項 → 退回押題
                         self._fallback_answer_group(opts, qtext=qtext)
                         self.log(f"📚→❓ 題庫有但選項配不到：{qshow}")
+                        # v1.8.51:診斷 dump — 題庫答案 vs 螢幕選項對照(raw + normalize),限 3 次/session
+                        if not hasattr(self, '_unmatch_dump_count'):
+                            self._unmatch_dump_count = 0
+                        if self._unmatch_dump_count < 3:
+                            self._unmatch_dump_count += 1
+                            try:
+                                ans_raw = " | ".join(repr(str(a)[:60]) for a in (ans_list or [])[:5])
+                                opts_raw = " | ".join(repr(str(lab)[:60]) for _, lab, _ in opts[:6])
+                                ans_norm = " | ".join(repr(QABank.normalize(str(a))[:60]) for a in (ans_list or [])[:5])
+                                opts_norm = " | ".join(repr(QABank.normalize(str(lab))[:60]) for _, lab, _ in opts[:6])
+                                self.log(f"🔬 [v1.8.51] 配不到 dump #{self._unmatch_dump_count}/3:")
+                                self.log(f"  題庫答案 raw : [{ans_raw}]")
+                                self.log(f"  螢幕選項 raw : [{opts_raw}]")
+                                self.log(f"  題庫答案 norm: [{ans_norm}]")
+                                self.log(f"  螢幕選項 norm: [{opts_norm}]")
+                            except Exception as _e:
+                                self.log(f"  dump 失敗: {_e}")
                     else:
                         self.log(f"📚 題庫命中：{qshow}")
                 else:
