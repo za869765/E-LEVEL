@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.53"
+VERSION = "1.8.54"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -4963,7 +4963,7 @@ class EClassApp:
         except Exception as e:
             self.log(f"⚠ dump 失敗：{e}")
 
-    def _auto_take_exam(self, max_retries=10):
+    def _auto_take_exam(self, max_retries=30):
         """v1.8.45 押題進化:
         - 抓分數記每次 (attempt, score, answers) → 爬山反推
         - 機率預測:第 3 次起評估,估計最終 < (pass-10) → 跳
@@ -5001,6 +5001,14 @@ class EClassApp:
             self._attempt_history = []   # [{attempt, score, answers: {qsig: [labels]}, fallback_qsigs: set}]
             self._best_attempt = None
             self._ai_supplement_mode = False   # AI 補刀開關(機率太低觸發)
+            # v1.8.54:A1.b 題庫命中題擾動爬山 state(每門課重置)
+            self._stagnation_baseline = None     # 卡關分數
+            self._stagnation_streak = 0           # 連續同分次數
+            self._perturb_phase = False           # 是否進入擾動模式
+            self._perturb_target_qsig = None      # 當前擾動哪題
+            self._perturb_tried_values = {}       # qsig -> set of tried values(已擾動過的)
+            self._perturb_verified = set()        # 已驗證的 qsig(對 or 試完)
+            self._perturb_db_hit_qsigs = set()    # 本門課題庫命中過的 qsigs(候選池)
             # 取及格分(若已抓到,否則預設 75)
             pass_score = self._current_exam_pass if self._current_exam_pass else 75.0
             score_trail = []
@@ -5086,6 +5094,64 @@ class EClassApp:
                     # 爬山反推:跟前一次分數比,若有上升把擾動題寫題庫
                     self._learn_from_perturbation()
 
+                    # v1.8.54:A1.b 擾動結果處理(若上次有 target,看分數差判斷對錯)
+                    if (self._perturb_phase and self._perturb_target_qsig
+                            and score is not None and self._stagnation_baseline is not None):
+                        baseline = self._stagnation_baseline
+                        delta = score - baseline
+                        target = self._perturb_target_qsig
+                        qtext_t = self._last_attempt_q_by_sig.get(target, "")
+                        qshow_t = (qtext_t[:30] + "...") if len(qtext_t) > 30 else qtext_t
+                        if delta >= 5:   # 分數上升 → 擾動 value 對
+                            picked_lab = (self._last_attempt_answers.get(target) or [None])[0]
+                            if picked_lab and qtext_t:
+                                try:
+                                    self.qa_bank.add(
+                                        qtext_t, [picked_lab],
+                                        qtype=self._last_attempt_type_by_sig.get(target, "SC"),
+                                        course=getattr(self, "_current_course_title", ""),
+                                        overwrite=True)
+                                    self.log(f"🎯 [v1.8.54] 擾動成功! 題「{qshow_t}」答案改為「{picked_lab}」(分數 {baseline:.0f}→{score:.0f})")
+                                except Exception as _e:
+                                    self.log(f"⚠ 擾動寫題庫失敗: {_e}")
+                            self._perturb_verified.add(target)
+                            self._perturb_target_qsig = None
+                            self._stagnation_baseline = score
+                            self._stagnation_streak = 1
+                        elif delta <= -5:   # 分數下降 → 題庫答案對
+                            self.log(f"✓ [v1.8.54] 題「{qshow_t}」題庫對(擾動使分數降 {baseline:.0f}→{score:.0f}),驗證")
+                            self._perturb_verified.add(target)
+                            self._perturb_target_qsig = None
+                        else:   # 沒變 → 試下個 value
+                            self.log(f"🔬 [v1.8.54] 題「{qshow_t}」擾動無變化(分數 {score:.0f}),試下個 value")
+                            # 保留 target,下次 _pick_perturb_value 自動選新 value
+
+                    # v1.8.54:A1.b stagnation 偵測 + 啟動擾動
+                    if score is not None and not self._perturb_phase:
+                        if self._stagnation_baseline is None:
+                            self._stagnation_baseline = score
+                            self._stagnation_streak = 1
+                        elif score == self._stagnation_baseline:
+                            self._stagnation_streak += 1
+                        else:
+                            self._stagnation_baseline = score
+                            self._stagnation_streak = 1
+                        if self._stagnation_streak >= 3:
+                            self._perturb_phase = True
+                            self.log(f"🔬 [v1.8.54] 連 {self._stagnation_streak} 次卡 {score:.0f} 分 → 啟動 A1.b 擾動爬山")
+
+                    # v1.8.54:A1.b 選下個擾動目標(若進入擾動且無 target)
+                    if self._perturb_phase and self._perturb_target_qsig is None:
+                        next_target = self._pick_next_perturb_target()
+                        if next_target is None:
+                            self.log(f"🔬 [v1.8.54] 所有題庫命中題已試完,放棄擾動")
+                            self._stats["courses_failed"] += 1
+                            terminate_reason = "擾動試完仍無解"
+                            break
+                        self._perturb_target_qsig = next_target
+                        qshow_n = self._last_attempt_q_by_sig.get(next_target, "")[:30]
+                        self.log(f"🔬 [v1.8.54] 下個擾動目標: 「{qshow_n}」")
+
                     # 系統作答上限
                     blocked, key = self._exam_attempts_exhausted()
                     if blocked:
@@ -5095,7 +5161,8 @@ class EClassApp:
                         break
 
                     # 機率預測:第 3 次起評估(v1.8.46 修:過濾 None + 用最近 3 次成長率)
-                    if attempt >= 3 and score is not None:
+                    # v1.8.54:A1.b 進入擾動模式時跳過機率預測(避免擾動跑到一半被放棄)
+                    if attempt >= 3 and score is not None and not self._perturb_phase:
                         valid_scores = [s for s in score_trail if s is not None]
                         avg_growth = None
                         if len(valid_scores) >= 3:
@@ -5120,8 +5187,9 @@ class EClassApp:
                                 self.log(f"🤖 AI 補刀啟動:估最終 {predicted:.0f} < pass {pass_score:.0f},還有 {len(self._last_attempt_fallback_qsigs)} 題未命中")
                                 self._ai_supplement_mode = True
 
-                    # 第 10 次失敗且當前 < pass-5 → 不破例
-                    if attempt == max_retries:
+                    # 第 N 次失敗且當前 < pass-5 → 不破例
+                    # v1.8.54:A1.b 擾動模式下不主動放棄,讓擾動跑到 _pick_next_perturb_target 自然結束
+                    if attempt == max_retries and not self._perturb_phase:
                         if score is None or score < pass_score - 5:
                             self.log(f"🛑 達 {max_retries} 次,當前 {score_show} < pass-5,放棄")
                             self._stats["courses_failed"] += 1
@@ -5241,6 +5309,58 @@ class EClassApp:
                 self.log(f"📈 分數 {prev_s:.0f}→{cur_s:.0f} (+{delta:.0f}),爬山候選鎖定 {n_lock} 題答案")
         except Exception as e:
             self.log(f"⚠ _learn_from_perturbation 例外: {e}")
+
+    def _pick_perturb_value(self, opts, ans_list):
+        """v1.8.54:A1.b 為當前擾動 target 選一個未試過的 value
+        策略:從 opts 取 value 屬性,排除「題庫 ans 對應的 value」+「已試過的 value」
+        回傳 value 字串,或 None(候選用完)
+        """
+        qsig = self._perturb_target_qsig
+        if not qsig:
+            return None
+        tried = self._perturb_tried_values.setdefault(qsig, set())
+
+        # 找題庫 ans 對應的 value(已知答案,跳過)
+        db_value = None
+        try:
+            for inp, lab, _ in opts:
+                if not lab:
+                    continue
+                for ans in ans_list:
+                    if self._texts_match(lab, ans):
+                        db_value = (inp.get_attribute("value") or "").strip()
+                        break
+                if db_value:
+                    break
+        except Exception:
+            pass
+
+        # 收集候選:未試過 + 不是題庫 value + value 不空
+        candidates = []
+        try:
+            for inp, _lab, _ in opts:
+                v = (inp.get_attribute("value") or "").strip()
+                if v and v != db_value and v not in tried:
+                    candidates.append(v)
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+        pick = candidates[0]
+        tried.add(pick)
+        return pick
+
+    def _pick_next_perturb_target(self):
+        """v1.8.54:A1.b 從題庫命中題候選池挑下個未驗證的 qsig
+        排除已驗證(對 / 試完) 的題目
+        """
+        candidates = [q for q in self._perturb_db_hit_qsigs
+                      if q not in self._perturb_verified]
+        if not candidates:
+            return None
+        # 取第一個(穩定 cycle)
+        return sorted(candidates)[0]
 
     # ── 答題：題庫優先，押題 fallback ─────────────────────
 
@@ -5672,23 +5792,51 @@ class EClassApp:
 
                 if hit:
                     n_db_hit += 1
+                    # v1.8.54:A1.b 紀錄這題進「題庫命中題」候選池(供擾動 cycle 使用)
+                    if qsig:
+                        self._perturb_db_hit_qsigs.add(qsig)
                     # 3) 從題庫答案文字匹配選項
                     ans_list = hit.get("a") or []
                     qtype = hit.get("type", "SC")
+                    # v1.8.54:A1.b 若該題是擾動目標 → 不照題庫 ans,改選擾動 value
+                    perturb_value = None
+                    if (self._perturb_phase and qsig
+                            and qsig == self._perturb_target_qsig):
+                        perturb_value = self._pick_perturb_value(opts, ans_list)
+                        if perturb_value is None:
+                            # 該題擾動候選用完 → 標記驗證、本次仍照題庫
+                            self._perturb_verified.add(qsig)
+                            self.log(f"🔬 [v1.8.54] 擾動「{(qtext or '')[:30]}」候選用完,標記驗證")
+                        else:
+                            self.log(f"🔬 [v1.8.54] 擾動「{(qtext or '')[:30]}」: 試 value={perturb_value} (原 ans={ans_list[0] if ans_list else '?'})")
                     clicked_any = False
-                    for inp, lab, itype in opts:
-                        for ans in ans_list:
-                            if self._texts_match(lab, ans):
-                                try:
-                                    self.driver.execute_script(
-                                        "arguments[0].click()", inp)
+                    if perturb_value is not None:
+                        # 擾動模式:選 value 對應的 input,跳過 _texts_match
+                        for inp, lab, itype in opts:
+                            try:
+                                v = (inp.get_attribute("value") or "").strip()
+                                if v == perturb_value:
+                                    self.driver.execute_script("arguments[0].click()", inp)
                                     clicked_any = True
                                     if itype == "radio":
                                         break
-                                except Exception:
-                                    pass
-                        if clicked_any and itype == "radio":
-                            break
+                            except Exception:
+                                pass
+                    else:
+                        # 正常題庫 ans 匹配
+                        for inp, lab, itype in opts:
+                            for ans in ans_list:
+                                if self._texts_match(lab, ans):
+                                    try:
+                                        self.driver.execute_script(
+                                            "arguments[0].click()", inp)
+                                        clicked_any = True
+                                        if itype == "radio":
+                                            break
+                                    except Exception:
+                                        pass
+                            if clicked_any and itype == "radio":
+                                break
                     qshow = qtext[:60] + ("..." if len(qtext) > 60 else "")
                     if not clicked_any:
                         # 答案文字配不到任何選項 → 退回押題
