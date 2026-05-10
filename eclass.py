@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.49"
+VERSION = "1.8.50"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -4244,8 +4244,9 @@ class EClassApp:
         # v1.8.49:keyword 與數字間允許 0~5 個非數字字符(吃「成績為 60 分」「得分是 70 分」)
         self._last_exam_score = None
         try:
-            # 1) 「分數:65」「得分 65」「成績為 60 分」「score: 70」
-            m = re.search(r'(?:分數|得分|成績|score)[^\d\n]{0,5}(\d+(?:\.\d+)?)\s*分?',
+            # 1) 「分數:65」「得分 65」「成績為 60 分」「總分 = 50」「score: 70」
+            # v1.8.50:加「總分」keyword(etainan/nera 等台南/中央站皆用「總分 = N」格式,v1.8.49 dump 確認)
+            m = re.search(r'(?:分數|得分|成績|score|總分)[^\d\n]{0,5}(\d+(?:\.\d+)?)\s*分?',
                           all_text, re.IGNORECASE)
             if m:
                 v = float(m.group(1))
