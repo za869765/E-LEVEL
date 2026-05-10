@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.55"
+VERSION = "1.8.56"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -3085,12 +3085,30 @@ class EClassApp:
         for attempt in range(MAX_RETRY):
             tag = f"第 {attempt+1}/{MAX_RETRY} 輪"
             # 切回上課頁
+            # v1.8.56:加 5 秒 retry + 沒「上課去」按鈕時直接試 retry_jump_fn 跳測驗
+            #   原 bug:0 秒內 4 輪全失敗(同一 timestamp),沒等沒 retry,
+            #          且對「沒上課去按鈕」的課(已上滿/設計如此)整套補課邏輯失效
+            jump_ok = False
             try:
-                if not self._try_jump_to_lesson_sysbar():
-                    self.log(f"⚠ {tag} 切回上課頁失敗,跳過本輪")
-                    continue
+                jump_ok = self._try_jump_to_lesson_sysbar()
+                if not jump_ok:
+                    self.log(f"⚠ {tag} 切回上課頁失敗,等 5 秒後 retry")
+                    self._human_sleep(5.0, 1.0)
+                    jump_ok = self._try_jump_to_lesson_sysbar()
             except Exception as e:
                 self.log(f"⚠ {tag} 切回上課頁錯誤: {e}")
+
+            if not jump_ok:
+                # 跳不到上課頁 → 站方可能頁面 stale 或課程沒「上課去」按鈕
+                # 直接試 retry_jump_fn(可能能跳成,不需補課)
+                self.log(f"⚠ {tag} 無「上課去」按鈕,跳過補課直接試 {label}")
+                try:
+                    if retry_jump_fn():
+                        self.log(f"⚡ {tag} {label} 直接跳成功(無需補課)")
+                        return True
+                except Exception as _e:
+                    self.log(f"⚠ {tag} 直接 {label} 例外: {_e}")
+                self.log(f"⚠ {tag} 直接 {label} 也失敗,進下一輪")
                 continue
             self._human_sleep(2.0, 0.5)
 
