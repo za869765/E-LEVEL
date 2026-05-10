@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.51"
+VERSION = "1.8.52"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -1398,6 +1398,9 @@ class EClassApp:
         threading.Thread(target=self._login_thread, args=(account, password), daemon=True).start()
 
     def _login_thread(self, account, password):
+        # v1.8.52:cache 給未來 relogin 用
+        self._last_account = account
+        self._last_password = password
         try:
             self._start_driver()
             self._login_elearn(account, password)
@@ -2010,10 +2013,15 @@ class EClassApp:
         finally:
             self._set_status("已結束")
             self.running = False
-            if self._is_logged_in():
-                self._set_btn_layout("ready")
-            else:
-                self._set_btn_layout("pre_login")
+            # v1.8.52:X1 自動結束時 quit 瀏覽器,避免分頁留著被閒置 dialog 干擾
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except Exception:
+                    pass
+                self.driver = None
+                self.log("✓ [v1.8.52] 已自動關閉瀏覽器")
+            self._set_btn_layout("pre_login")
 
     def _click_tab(self, keyword):
         """點擊包含 keyword 的分頁，回傳是否成功"""
@@ -2947,6 +2955,28 @@ class EClassApp:
         except Exception: pass
         return False
 
+    def _check_kicked_alert(self):
+        """v1.8.52:Y1 偵測「由於你的帳號閒置過久已被登出」瀏覽器原生 alert
+        回傳:True=有此 alert 且已 accept,False=無或非閒置 alert
+        注意:跟 _idle_dialog_visible (HTML 對話框)不同 — 這是瀏覽器原生 alert (alert/confirm)
+        """
+        try:
+            a = self.driver.switch_to.alert
+            text = (a.text or "")
+            if any(k in text for k in ("閒置", "已被登出", "重新登入後")):
+                self.log(f"⚠ [v1.8.52] 偵測到閒置登出 alert: {text[:100]}")
+                try:
+                    a.accept()
+                    self.log("  → 已 accept alert")
+                except Exception as e:
+                    self.log(f"  → accept 失敗: {e}")
+                return True
+            # 非閒置 alert(可能是測驗確認 dialog 等)→ 不動,讓其他邏輯處理
+        except Exception:
+            # 沒 alert 或 alert 已被別處處理
+            pass
+        return False
+
     def _idle_dialog_visible(self):
         """v1.8.22：偵測是否仍有「閱讀閒置提醒」對話框（已被 _dismiss_player_popup 嘗試後仍在）
         辨識特徵：頁面或任一 frame 內可見文字含關鍵字。
@@ -3117,6 +3147,12 @@ class EClassApp:
         fallback_buffer_added = False
 
         while self.running:
+            # v1.8.52:Y1 偵測「由於你的帳號閒置過久已被登出」瀏覽器 alert
+            # 偵測到就 accept + 結束本次跑(請使用者手動重新登入)
+            if self._check_kicked_alert():
+                self.log("⚠ [v1.8.52] 已 accept 登出 alert,結束本次自動上課(請手動重新登入)")
+                self.running = False
+                return
             # ── 每次循環優先處理驗證彈窗（30分鐘一次，不處理會被登出）──
             self._dismiss_player_popup()
 
