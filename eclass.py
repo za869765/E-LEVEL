@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.54"
+VERSION = "1.8.55"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -595,6 +595,16 @@ class EClassApp:
                 pass
             time.sleep(6)
             text, status = _do_call()
+        # v1.8.55:#3 timeout (HTTP 0 + body 含 timed out) 也重試一次
+        if text is None and isinstance(status, tuple) and status[0] == 0:
+            body_e = str(status[1] or "")
+            if "timed out" in body_e.lower() or "timeout" in body_e.lower():
+                try:
+                    self.log("⚠ Gemini timeout,3 秒後重試一次")
+                except Exception:
+                    pass
+                time.sleep(3)
+                text, status = _do_call()
         self._gemini_last_call = time.time()
         return text, status
 
@@ -1965,6 +1975,13 @@ class EClassApp:
                         self.log(f"⚠ 未完成分頁找不到任何課程入口，但登入彈窗顯示尚有 "
                                  f"{self.popup_pending_course} 門未完成（第 {miss_unfinished} 次）")
                         self._dump_unfinished_debug()
+                        # v1.8.55:#1 第 1/2 次失敗時嘗試切「未完成(有時數)」分頁(站方分頁差異)
+                        # log 看到 nav text:「未完成(有時數) (2)」表示有時數的課在另一個分頁
+                        if miss_unfinished <= 2:
+                            if self._click_tab("有時數"):
+                                self.log("✓ [v1.8.55] 切到「未完成(有時數)」分頁,重試找課程入口...")
+                                time.sleep(3)
+                                continue
                         if miss_unfinished >= 3:
                             self.log("⚠ 已連續 3 次找不到未完成課程入口，請查看 DEBUG dump")
                             self.log("⚠ 不跳到「已完成」分頁（避免誤判），結束本次自動上課")
@@ -3189,6 +3206,19 @@ class EClassApp:
                 if idle_dlg_first_seen is None:
                     idle_dlg_first_seen = time.time()
                     self.log("⚠ 偵測到「閱讀閒置提醒」對話框，找不到「確定」按鈕；270 秒後將主動跳測驗頁")
+                    # v1.8.55:#2 第 1 次偵測到時 dump 整個 page source 到檔案,供未來分析按鈕 selector
+                    if not getattr(self, '_idle_dump_done', False):
+                        self._idle_dump_done = True
+                        try:
+                            ts = time.strftime("%Y%m%d_%H%M%S")
+                            path = os.path.join(_DATA_DIR, f"debug_idle_dialog_{ts}.html")
+                            self.driver.switch_to.default_content()
+                            html = self._scrub_sensitive_html(self.driver.page_source or "")
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(html[:2_000_000])
+                            self.log(f"🔬 [v1.8.55] idle dialog page source 已 dump: {os.path.basename(path)}")
+                        except Exception as _e:
+                            self.log(f"⚠ idle dialog dump 失敗: {_e}")
                 elapsed_idle = time.time() - idle_dlg_first_seen
                 if elapsed_idle >= IDLE_DLG_TIMEOUT:
                     self.log(f"⏰ 閒置對話框已持續 {elapsed_idle:.0f}s 仍無法關閉 → 主動跳測驗頁避險")
