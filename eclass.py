@@ -67,7 +67,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.57"
+VERSION = "1.8.58"
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -3430,12 +3430,18 @@ class EClassApp:
                         # v1.8.22：章節耗盡 → dump 後立刻嘗試跳測驗（不必空轉等 idle dialog）
                         self.log("⚠ 連續 3 次找不到章節，dump player HTML...")
                         self._dump_player_debug()
-                        self.log("章節耗盡，主動嘗試跳測驗頁...")
-                        if self._try_jump_to_exam_sysbar():
-                            self.log("⚡ 章節耗盡跳測驗成功 → 退出 learning_loop")
-                            return
-                        self.log("跳測驗失敗，停留在課程頁面（等待時數累積）...")
-                        time.sleep(60)
+                        # v1.8.58:時數明顯不夠(< 50% target) → 跳過跳測驗,省 12 秒 timeout
+                        elapsed_min_now = (time.time() - start_time) / 60
+                        if target_min > 0 and elapsed_min_now / target_min < 0.5:
+                            self.log(f"⏳ 時數 {elapsed_min_now*60:.0f}/{target_min*60:.0f} 秒(< 50%),跳測驗一定被擋 → 純停留等時數")
+                            time.sleep(60)
+                        else:
+                            self.log("章節耗盡，主動嘗試跳測驗頁...")
+                            if self._try_jump_to_exam_sysbar():
+                                self.log("⚡ 章節耗盡跳測驗成功 → 退出 learning_loop")
+                                return
+                            self.log("跳測驗失敗，停留在課程頁面（等待時數累積）...")
+                            time.sleep(60)
                     else:
                         self.log("停留在課程頁面（等待時數累積）...")
                         time.sleep(60)
