@@ -171,8 +171,11 @@ def _show_no_network_dialog():
 
 
 def _archive_older_exes():
-    """把同層舊版 EXE 搬到 dist/old/（或 EXE 同層 old/）。
-    重用 NUMBER 的 retry 機制（檔案鎖時等 0.5s × 10）。"""
+    """把同層「比自己舊」的 EXE 搬到 EXE 同層 old/。
+    對齊 NUMBER 作法（v1.8.60-rebuild）：
+      #1 bg thread 呼叫（在 run_update_check 內）— 避免 retry 5s 卡啟動
+      #2 比 semver 才搬 — 同層同版/更新版的 EXE 不動，避免共存 EXE 互搬
+    retry 機制（10×0.5s=5s）等舊 EXE process 釋放檔案鎖。"""
     if not getattr(sys, "frozen", False):
         return
     exe_path = sys.executable
@@ -183,7 +186,11 @@ def _archive_older_exes():
         os.makedirs(old_dir, exist_ok=True)
     except Exception:
         return
-    pattern = re.compile(r"E等公務園_v\d+\.\d+\.\d+(_RELEASE|_DEBUG)?\.exe$", re.IGNORECASE)
+    pattern = re.compile(
+        r"^E等公務園_v(\d+)\.(\d+)\.(\d+)(?:_RELEASE|_DEBUG)?\.exe$",
+        re.IGNORECASE,
+    )
+    self_ver = _version_tuple(VERSION)
     try:
         entries = os.listdir(exe_dir)
     except Exception:
@@ -191,8 +198,15 @@ def _archive_older_exes():
     for fn in entries:
         if fn == exe_name:
             continue
-        if not pattern.match(fn):
+        m = pattern.match(fn)
+        if not m:
             continue
+        try:
+            other_ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            continue
+        if other_ver >= self_ver:
+            continue   # #2 同版或更新 → 不動（保護共存 EXE）
         src = os.path.join(exe_dir, fn)
         if not os.path.isfile(src):
             continue
@@ -386,9 +400,10 @@ def run_update_check():
        無網路 / 拿不到 = 跳錯誤對話框 exit；有新版 = 跳更新對話框；同版 = 繼續啟動主程式。
        本函式 return 代表「可以繼續啟動主程式」。
        不 return（os._exit）代表流程被攔截。"""
-    # archive 舊版（後台/同步皆可，eclass 啟動慢 selenium，archive 同步無感）
+    # archive 舊版（#1 對齊 NUMBER 改 bg thread，避免剛切版時舊 EXE 沒釋放鎖、
+    # retry 5s 卡住啟動畫面。bg thread 平行跑 + retry，使用者看到對話框時已搬完）
     try:
-        _archive_older_exes()
+        threading.Thread(target=_archive_older_exes, daemon=True).start()
     except Exception:
         pass
     state, info = _fetch_latest_release()
