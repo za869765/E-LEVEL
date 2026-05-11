@@ -95,8 +95,10 @@ def _version_tuple(s):
 
 def _fetch_latest_release():
     """打 GitHub API 查 /releases/latest。
-    成功回 {"version":"1.8.60", "url":..., "size":int, "notes":str, "name":str}
-    任何失敗回 None（網路 / API / parse 失敗都包進來）"""
+    回 (state, info)：
+      state="ok":         info = {version, url, size, notes, name}
+      state="no_release": API 通但沒對應 release（含 404、無 .exe asset、tag 空）→ graceful 放行
+      state="no_network": 連不上 GitHub（DNS / timeout / 5xx）→ 擋住，eclass 不能離線跑"""
     try:
         req = urllib.request.Request(
             GITHUB_API_LATEST,
@@ -107,24 +109,30 @@ def _fetch_latest_release():
         )
         with urllib.request.urlopen(req, timeout=UPDATE_HTTP_TIMEOUT) as r:
             data = json.load(r)
+    except urllib.error.HTTPError as e:
+        # 404 = 該 repo 沒任何 release（首次部署或所有 release 都刪了）
+        # 其他 4xx/5xx 視為網路/伺服器問題，擋住
+        if getattr(e, "code", None) == 404:
+            return ("no_release", None)
+        return ("no_network", None)
     except Exception:
-        return None
+        return ("no_network", None)
     tag = (data.get("tag_name") or "").lstrip("vV")
     if not tag:
-        return None
+        return ("no_release", None)
     exe_asset = next(
         (a for a in (data.get("assets") or []) if (a.get("name") or "").lower().endswith(".exe")),
         None,
     )
     if not exe_asset:
-        return None
-    return {
+        return ("no_release", None)
+    return ("ok", {
         "version": tag,
         "url": exe_asset.get("browser_download_url") or "",
         "size": int(exe_asset.get("size") or 0),
         "notes": (data.get("body") or "")[:500],
         "name": exe_asset.get("name") or "",
-    }
+    })
 
 
 def _show_no_network_dialog():
@@ -383,11 +391,15 @@ def run_update_check():
         _archive_older_exes()
     except Exception:
         pass
-    info = _fetch_latest_release()
-    if info is None:
-        # 沒網路或 GitHub API 不通：eclass 反正不能離線跑，直接擋下
+    state, info = _fetch_latest_release()
+    if state == "no_network":
+        # 連不上 GitHub：eclass 反正不能離線跑（需 hiva / Gemini），擋下
         _show_no_network_dialog()
         return  # unreachable
+    if state == "no_release":
+        # API 通但無 release（首次部署 / 暫時無 release）→ graceful 直接啟動
+        return
+    # state == "ok"：比版本
     if _version_tuple(info["version"]) > _version_tuple(VERSION):
         _show_update_dialog(info)
         return  # unreachable（dialog 結束會 os._exit）
