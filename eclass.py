@@ -35,6 +35,8 @@ import sys
 import random
 import urllib.request
 import urllib.parse
+import subprocess
+import shutil
 from html.parser import HTMLParser
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,7 +69,329 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.58"
+VERSION = "1.8.59"
+
+# ══════════════════════════════════════════════════════════
+# v1.8.59 自動更新（GitHub Releases 方案）
+#   架構：EXE 啟動 → GitHub API 查 /releases/latest → 比版本 → 強制更新
+#   雷區（NUMBER 已踩過、見 feedback_pyinstaller_windowed_subprocess.md）：
+#     1. PyInstaller --windowed + subprocess.Popen + stdout=PIPE = 死，全 DEVNULL
+#     2. urllib 下載大檔可能 stall，只用 urllib 抓 ~2KB JSON metadata
+#     3. 大檔一律用 curl.exe 阻塞 + main-thread poll size 算進度
+# ══════════════════════════════════════════════════════════
+GITHUB_REPO = "za869765/E-LEVEL"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_HTTP_TIMEOUT = 3   # GitHub API timeout（秒）
+UPDATE_MIN_EXE_SIZE = 10 * 1024 * 1024   # 下載後 sanity check（10 MB）
+
+
+def _version_tuple(s):
+    """字串版本轉 tuple，避免 '1.8.10' < '1.8.9' 字串比較陷阱"""
+    try:
+        return tuple(int(x) for x in str(s).lstrip("vV").split("."))
+    except Exception:
+        return (0,)
+
+
+def _fetch_latest_release():
+    """打 GitHub API 查 /releases/latest。
+    成功回 {"version":"1.8.60", "url":..., "size":int, "notes":str, "name":str}
+    任何失敗回 None（網路 / API / parse 失敗都包進來）"""
+    try:
+        req = urllib.request.Request(
+            GITHUB_API_LATEST,
+            headers={
+                "User-Agent": f"E-LEVEL-Updater/{VERSION}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=UPDATE_HTTP_TIMEOUT) as r:
+            data = json.load(r)
+    except Exception:
+        return None
+    tag = (data.get("tag_name") or "").lstrip("vV")
+    if not tag:
+        return None
+    exe_asset = next(
+        (a for a in (data.get("assets") or []) if (a.get("name") or "").lower().endswith(".exe")),
+        None,
+    )
+    if not exe_asset:
+        return None
+    return {
+        "version": tag,
+        "url": exe_asset.get("browser_download_url") or "",
+        "size": int(exe_asset.get("size") or 0),
+        "notes": (data.get("body") or "")[:500],
+        "name": exe_asset.get("name") or "",
+    }
+
+
+def _show_no_network_dialog():
+    """無網路或拿不到 release info → 跳明確錯誤對話框 + exit。
+    eclass 一定要網路（連 hiva 網站、Gemini），離線無法執行。"""
+    root = tk.Tk()
+    root.title("E等公務園 — 無法連線")
+    root.geometry("440x220")
+    root.resizable(False, False)
+    try:
+        root.iconbitmap(default="")
+    except Exception:
+        pass
+    tk.Label(root, text="⚠", font=("Segoe UI Emoji", 36), fg="#d32f2f").pack(pady=(18, 6))
+    tk.Label(
+        root,
+        text="無法連線 GitHub 確認版本",
+        font=("Microsoft JhengHei", 13, "bold"),
+    ).pack()
+    tk.Label(
+        root,
+        text=("本工具需要網路才能執行\n"
+              "（連線 hiva 學習平台、Gemini AI）\n"
+              "請確認網路連線後重新開啟"),
+        font=("Microsoft JhengHei", 10),
+        fg="#555",
+        justify="center",
+    ).pack(pady=(6, 12))
+    tk.Button(
+        root, text="關閉", font=("Microsoft JhengHei", 11),
+        width=12, command=lambda: (root.destroy(), os._exit(0)),
+    ).pack()
+    root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy(), os._exit(0)))
+    root.mainloop()
+    os._exit(0)
+
+
+def _archive_older_exes():
+    """把同層舊版 EXE 搬到 dist/old/（或 EXE 同層 old/）。
+    重用 NUMBER 的 retry 機制（檔案鎖時等 0.5s × 10）。"""
+    if not getattr(sys, "frozen", False):
+        return
+    exe_path = sys.executable
+    exe_dir = os.path.dirname(exe_path)
+    exe_name = os.path.basename(exe_path)
+    old_dir = os.path.join(exe_dir, "old")
+    try:
+        os.makedirs(old_dir, exist_ok=True)
+    except Exception:
+        return
+    pattern = re.compile(r"E等公務園_v\d+\.\d+\.\d+(_RELEASE|_DEBUG)?\.exe$", re.IGNORECASE)
+    try:
+        entries = os.listdir(exe_dir)
+    except Exception:
+        return
+    for fn in entries:
+        if fn == exe_name:
+            continue
+        if not pattern.match(fn):
+            continue
+        src = os.path.join(exe_dir, fn)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(old_dir, fn)
+        for _ in range(10):
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+                shutil.move(src, dst)
+                break
+            except (PermissionError, OSError):
+                time.sleep(0.5)
+
+
+def _download_with_curl(url, dst_path, progress_cb=None):
+    """用 curl.exe 下載 EXE。bg thread 阻塞 subprocess.run，
+    main thread 透過 progress_cb 自己 poll dst_path 的 size 算 %。
+    return: True 成功 / False 失敗"""
+    tmp = dst_path + ".downloading"
+    err_file = dst_path + ".err"
+    for p in (tmp, err_file):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = 0x08000000  # CREATE_NO_WINDOW
+    try:
+        with open(err_file, "wb") as ef:
+            rc = subprocess.run(
+                ["curl.exe", "-L", "--fail", "--connect-timeout", "10",
+                 "--max-time", "180", "-o", tmp, url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=ef,
+                creationflags=creationflags,
+            ).returncode
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+    if rc != 0:
+        return False
+    if not os.path.exists(tmp) or os.path.getsize(tmp) < UPDATE_MIN_EXE_SIZE:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+    try:
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
+        os.rename(tmp, dst_path)
+    except Exception:
+        return False
+    try:
+        os.remove(err_file)
+    except Exception:
+        pass
+    return True
+
+
+def _handoff_to_new_exe(new_exe_path):
+    """啟動新版 EXE + 自殺。"""
+    try:
+        creationflags = 0
+        if os.name == "nt":
+            DETACHED = 0x00000008
+            NEW_GROUP = 0x00000200
+            creationflags = DETACHED | NEW_GROUP
+        subprocess.Popen(
+            [new_exe_path],
+            creationflags=creationflags,
+            close_fds=True,
+            cwd=os.path.dirname(new_exe_path),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def _show_update_dialog(info):
+    """強制更新對話框：顯示新版本/變更說明、下載按鈕、進度條。
+    完成後啟新版 + 自殺。
+    info: _fetch_latest_release() 回傳結構"""
+    if not getattr(sys, "frozen", False):
+        # 開發環境（直接跑 .py）不真的下載，跳過
+        return False
+    exe_dir = os.path.dirname(sys.executable)
+    new_exe_name = info.get("name") or f"E等公務園_v{info['version']}_RELEASE.exe"
+    new_exe_path = os.path.join(exe_dir, new_exe_name)
+
+    root = tk.Tk()
+    root.title(f"E等公務園 — 發現新版本 v{info['version']}")
+    root.geometry("520x360")
+    root.resizable(False, False)
+
+    tk.Label(
+        root, text=f"🆕 新版本 v{info['version']}",
+        font=("Microsoft JhengHei", 16, "bold"), fg="#1565c0",
+    ).pack(pady=(16, 4))
+    tk.Label(
+        root, text=f"目前版本：v{VERSION}",
+        font=("Microsoft JhengHei", 10), fg="#888",
+    ).pack()
+
+    notes_frame = tk.Frame(root)
+    notes_frame.pack(padx=20, pady=(10, 8), fill="both")
+    tk.Label(
+        notes_frame, text="更新說明",
+        font=("Microsoft JhengHei", 10, "bold"), anchor="w",
+    ).pack(fill="x")
+    notes_text = scrolledtext.ScrolledText(
+        notes_frame, height=6, font=("Microsoft JhengHei", 9),
+        wrap="word", bg="#f5f5f5", relief="flat", padx=8, pady=4,
+    )
+    notes_text.pack(fill="both")
+    notes_text.insert("1.0", info.get("notes") or "(無更新說明)")
+    notes_text.config(state="disabled")
+
+    msg_var = tk.StringVar(value=f"準備下載（約 {info['size'] / 1024 / 1024:.1f} MB）…")
+    tk.Label(
+        root, textvariable=msg_var, font=("Microsoft JhengHei", 10), fg="#444",
+    ).pack(pady=(4, 4))
+
+    btn_var = tk.StringVar(value=f"⬇ 立即更新 v{info['version']}")
+    btn = tk.Button(
+        root, textvariable=btn_var, font=("Microsoft JhengHei", 12, "bold"),
+        bg="#1565c0", fg="white", activebackground="#0d47a1", activeforeground="white",
+        width=22, height=1, relief="flat", cursor="hand2",
+    )
+    btn.pack(pady=(6, 8))
+
+    state = {"downloading": False, "done": False}
+
+    def _set_progress():
+        if not state["downloading"]:
+            return
+        if os.path.exists(new_exe_path + ".downloading"):
+            try:
+                cur = os.path.getsize(new_exe_path + ".downloading")
+                total = info["size"] or 1
+                pct = min(99, int(cur * 100 / total))
+                mb_cur = cur / 1024 / 1024
+                mb_tot = total / 1024 / 1024
+                msg_var.set(f"⬇ 下載中 {pct}% ({mb_cur:.1f} / {mb_tot:.1f} MB)")
+            except Exception:
+                pass
+        if state["downloading"]:
+            root.after(250, _set_progress)
+
+    def _download_thread():
+        ok = _download_with_curl(info["url"], new_exe_path)
+        state["downloading"] = False
+        if ok:
+            state["done"] = True
+            root.after(0, lambda: msg_var.set("✓ 下載完成，3 秒後啟動新版…"))
+            root.after(0, lambda: btn_var.set("✓ 已下載"))
+            root.after(0, lambda: btn.config(bg="#2e7d32", state="disabled"))
+            root.after(3000, lambda: _handoff_to_new_exe(new_exe_path))
+        else:
+            root.after(0, lambda: msg_var.set("✗ 下載失敗，請檢查網路或點重試"))
+            root.after(0, lambda: btn_var.set("🔄 重試下載"))
+            root.after(0, lambda: btn.config(bg="#e65100", state="normal"))
+
+    def _start_download():
+        if state["downloading"] or state["done"]:
+            return
+        state["downloading"] = True
+        btn.config(state="disabled", bg="#90a4ae")
+        btn_var.set("下載中…")
+        msg_var.set("⬇ 已連上 GitHub，正在下載…")
+        threading.Thread(target=_download_thread, daemon=True).start()
+        root.after(500, _set_progress)
+
+    btn.config(command=_start_download)
+    # 強制更新：關視窗 = 結束程式
+    root.protocol("WM_DELETE_WINDOW", lambda: (root.destroy(), os._exit(0)))
+    root.after(200, _start_download)   # 自動觸發下載
+    root.mainloop()
+    return True
+
+
+def run_update_check():
+    """v1.8.59 啟動流程：先 archive 舊版 → 查雲端 → 比版本 →
+       無網路 / 拿不到 = 跳錯誤對話框 exit；有新版 = 跳更新對話框；同版 = 繼續啟動主程式。
+       本函式 return 代表「可以繼續啟動主程式」。
+       不 return（os._exit）代表流程被攔截。"""
+    # archive 舊版（後台/同步皆可，eclass 啟動慢 selenium，archive 同步無感）
+    try:
+        _archive_older_exes()
+    except Exception:
+        pass
+    info = _fetch_latest_release()
+    if info is None:
+        # 沒網路或 GitHub API 不通：eclass 反正不能離線跑，直接擋下
+        _show_no_network_dialog()
+        return  # unreachable
+    if _version_tuple(info["version"]) > _version_tuple(VERSION):
+        _show_update_dialog(info)
+        return  # unreachable（dialog 結束會 os._exit）
+    # 同版或本機更新（dev build）→ 正常啟動
 
 # v1.8.7: 全專案固定 User-Agent（Selenium CDP override + qa_scraper HTTP request 同源）
 #   避免不同機器 UA 差異、也避免 HeadlessChrome 特徵殘留
@@ -6799,6 +7123,9 @@ class ApiKeyDialog(tk.Toplevel):
 # ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
+        # v1.8.59 自動更新檢查（僅 EXE 模式生效；dev 跑 .py 跳過）
+        if getattr(sys, "frozen", False):
+            run_update_check()
         app = EClassApp()
         app.run()
     except Exception as e:
