@@ -69,7 +69,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.59"
+VERSION = "1.8.60"
 
 # ══════════════════════════════════════════════════════════
 # v1.8.59 自動更新（GitHub Releases 方案）
