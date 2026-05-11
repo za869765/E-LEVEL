@@ -69,7 +69,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.60"
+VERSION = "1.8.61"
 
 # ══════════════════════════════════════════════════════════
 # v1.8.59 自動更新（GitHub Releases 方案）
@@ -425,6 +425,19 @@ def run_update_check():
 FIXED_USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.6099.109 Safari/537.36")
+# v1.8.61 隱藏 data/ 用：Windows 設 file/folder hidden 屬性
+def _hide_path(path):
+    """避免其他使用者亂動 data/ 設定檔。非 Windows 或失敗 noop。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_HIDDEN = 0x02
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+    except Exception:
+        pass
+
+
 # 打包成 exe 時用 sys.executable 定位，避免存到暫存目錄
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
@@ -432,6 +445,7 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR   = os.path.join(_BASE_DIR, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
+_hide_path(_DATA_DIR)   # v1.8.61 設 hidden，避免其他使用者亂動
 CONFIG_FILE = os.path.join(_DATA_DIR, "eclass_config.json")
 QA_BANK_FILE = os.path.join(_DATA_DIR, "qa_bank.json")
 QA_MISS_FILE = os.path.join(_DATA_DIR, "qa_missed.json")
