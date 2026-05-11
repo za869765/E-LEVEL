@@ -69,7 +69,7 @@ GEMINI_PRICE_IN  = 0.10 / 1_000_000   # 輸入 $0.10 / 1M tokens
 GEMINI_PRICE_OUT = 0.40 / 1_000_000   # 輸出 $0.40 / 1M tokens
 GEMINI_FREE_RPD  = 1500               # 免費版每日請求上限（進度條滿格）
 
-VERSION = "1.8.61"
+VERSION = "1.8.62"
 
 # ══════════════════════════════════════════════════════════
 # v1.8.59 自動更新（GitHub Releases 方案）
@@ -184,6 +184,7 @@ def _archive_older_exes():
     old_dir = os.path.join(exe_dir, "old")
     try:
         os.makedirs(old_dir, exist_ok=True)
+        _hide_path(old_dir)   # v1.8.62 old/ 隱藏，與 data/ 一致
     except Exception:
         return
     pattern = re.compile(
@@ -306,31 +307,18 @@ def _show_update_dialog(info):
 
     root = tk.Tk()
     root.title(f"E等公務園 — 發現新版本 v{info['version']}")
-    root.geometry("520x360")
+    # v1.8.62 拿掉「更新說明」區塊，對話框只剩「新版本/目前版本/下載進度/按鈕」
+    root.geometry("460x230")
     root.resizable(False, False)
 
     tk.Label(
         root, text=f"🆕 新版本 v{info['version']}",
         font=("Microsoft JhengHei", 16, "bold"), fg="#1565c0",
-    ).pack(pady=(16, 4))
+    ).pack(pady=(18, 4))
     tk.Label(
         root, text=f"目前版本：v{VERSION}",
         font=("Microsoft JhengHei", 10), fg="#888",
     ).pack()
-
-    notes_frame = tk.Frame(root)
-    notes_frame.pack(padx=20, pady=(10, 8), fill="both")
-    tk.Label(
-        notes_frame, text="更新說明",
-        font=("Microsoft JhengHei", 10, "bold"), anchor="w",
-    ).pack(fill="x")
-    notes_text = scrolledtext.ScrolledText(
-        notes_frame, height=6, font=("Microsoft JhengHei", 9),
-        wrap="word", bg="#f5f5f5", relief="flat", padx=8, pady=4,
-    )
-    notes_text.pack(fill="both")
-    notes_text.insert("1.0", info.get("notes") or "(無更新說明)")
-    notes_text.config(state="disabled")
 
     msg_var = tk.StringVar(value=f"準備下載（約 {info['size'] / 1024 / 1024:.1f} MB）…")
     tk.Label(
@@ -444,8 +432,11 @@ if getattr(sys, 'frozen', False):
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR   = os.path.join(_BASE_DIR, "data")
+_LOG_DIR    = os.path.join(_BASE_DIR, "log")
 os.makedirs(_DATA_DIR, exist_ok=True)
+os.makedirs(_LOG_DIR,  exist_ok=True)
 _hide_path(_DATA_DIR)   # v1.8.61 設 hidden，避免其他使用者亂動
+_hide_path(_LOG_DIR)    # v1.8.62 log/ 同樣隱藏
 CONFIG_FILE = os.path.join(_DATA_DIR, "eclass_config.json")
 QA_BANK_FILE = os.path.join(_DATA_DIR, "qa_bank.json")
 QA_MISS_FILE = os.path.join(_DATA_DIR, "qa_missed.json")
